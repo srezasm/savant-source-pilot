@@ -20,10 +20,10 @@ The locking is incomplete.
 
 The process control is fragile.
 
-- [ ] `run_adapter()` and `stop_adapter()` ignore return codes, stdout/stderr, and exceptions
-- [ ] Handle if Docker is missing
+- [X] `run_adapter()` and `stop_adapter()` ignore return codes, stdout/stderr, and exceptions
+- [X] Handle if Docker is missing
 - [ ] Handle if the image pull fails
-- [ ] Handle if the container name is invalid
+- [X] Handle if the container name is invalid
 - [ ] Handle if the RTSP stream is unreachable
 
 The Kafka handling is too brittle for production use.
