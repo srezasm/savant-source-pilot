@@ -3,6 +3,9 @@ import time
 import logging
 import subprocess
 import threading
+import logging
+from urllib.parse import urlparse
+import subprocess
 from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
 
@@ -17,6 +20,57 @@ dict_lock = threading.Lock()
 active_sources = {}
 
 
+def validate_rtsp_url(rtsp_url: str, test_connection: bool = True) -> tuple[bool, str]:
+    """
+    Validates RTSP URL. Can also test actual connection if test_connection=True.
+    """
+    if not rtsp_url or not isinstance(rtsp_url, str):
+        return False, "RTSP URL is empty or invalid type"
+
+    rtsp_url = rtsp_url.strip()
+
+    if not rtsp_url.startswith("rtsp://"):
+        return False, "Must start with 'rtsp://'"
+
+    parsed = urlparse(rtsp_url)
+    if not parsed.netloc:
+        return False, "Missing host in URL"
+
+    if test_connection:
+        logging.info(f"Testing RTSP connection to: {rtsp_url}")
+        try:
+            # Use ffprobe (from ffmpeg) to test the stream
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-rtsp_transport",
+                    "tcp",
+                    "-i",
+                    rtsp_url,
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+
+            if result.returncode == 0:
+                logging.info(f"RTSP connection test successful: {rtsp_url}")
+                return True, "Valid and reachable"
+            else:
+                return False, f"Cannot connect to stream (ffprobe failed)"
+
+        except FileNotFoundError:
+            logging.warning("ffprobe not found. Skipping connection test.")
+            return True, "Format looks valid (ffprobe not available for testing)"
+        except subprocess.TimeoutExpired:
+            return False, "Connection test timed out"
+        except Exception as e:
+            return False, f"Connection test error: {str(e)}"
+
+    return True, "Format looks valid"
+
+
 def add_sources(message):
     rtsp_id = message.get("id")
     rtsp_url = message.get("rtsp")
@@ -29,6 +83,12 @@ def add_sources(message):
         if rtsp_id in active_sources:
             logging.warning(f"RTSP id '{rtsp_id}' already exists")
             return
+
+    # Validate RTSP
+    is_valid, msg = validate_rtsp_url(rtsp_url, test_connection=True)
+    if not is_valid:
+        logging.error(f"Invalid RTSP URL for {rtsp_id}: {msg}")
+        return
 
     logging.info(f"Adding source: {rtsp_id} -> {rtsp_url}")
 
@@ -105,6 +165,8 @@ def run_adapter(message: dict):
                 "-d",
                 "--name",
                 adapter_name,
+                "--network",
+                "host",
                 "--entrypoint",
                 "/opt/savant/adapters/gst/sources/rtsp.sh",
                 "-e",
@@ -160,7 +222,7 @@ def stop_adapter(message: dict):
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=60,
         )
 
         if result.returncode == 0:
