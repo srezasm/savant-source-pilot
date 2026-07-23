@@ -20,21 +20,23 @@ dict_lock = threading.Lock()
 active_sources = {}
 
 
-def validate_rtsp_url(rtsp_url: str, test_connection: bool = True) -> tuple[bool, str]:
+def validate_rtsp_url(
+    rtsp_url: str, test_connection: bool = True
+) -> tuple[bool, bool, str]:
     """
     Validates RTSP URL. Can also test actual connection if test_connection=True.
     """
     if not rtsp_url or not isinstance(rtsp_url, str):
-        return False, "RTSP URL is empty or invalid type"
+        return False, False, "RTSP URL is empty or invalid type"
 
     rtsp_url = rtsp_url.strip()
 
     if not rtsp_url.startswith("rtsp://"):
-        return False, "Must start with 'rtsp://'"
+        return False, False, "Must start with 'rtsp://'"
 
     parsed = urlparse(rtsp_url)
     if not parsed.netloc:
-        return False, "Missing host in URL"
+        return False, False, "Missing host in URL"
 
     if test_connection:
         logging.info(f"Testing RTSP connection to: {rtsp_url}")
@@ -56,17 +58,17 @@ def validate_rtsp_url(rtsp_url: str, test_connection: bool = True) -> tuple[bool
 
             if result.returncode == 0:
                 logging.info(f"RTSP connection test successful: {rtsp_url}")
-                return True, "Valid and reachable"
+                return True, False, "Valid and reachable"
             else:
-                return False, f"Cannot connect to stream (ffprobe failed)"
+                return False, True, f"Cannot connect to stream (ffprobe failed)"
 
         except FileNotFoundError:
             logging.warning("ffprobe not found. Skipping connection test.")
-            return True, "Format looks valid (ffprobe not available for testing)"
+            return True, False, "Format looks valid (ffprobe not available for testing)"
         except subprocess.TimeoutExpired:
-            return False, "Connection test timed out"
+            return False, True, "Connection test timed out"
         except Exception as e:
-            return False, f"Connection test error: {str(e)}"
+            return False, True, f"Connection test error: {str(e)}"
 
     return True, "Format looks valid"
 
@@ -85,21 +87,26 @@ def add_sources(message):
             return
 
     # Validate RTSP
-    is_valid, msg = validate_rtsp_url(rtsp_url, test_connection=True)
+    is_valid, retry, msg = validate_rtsp_url(rtsp_url, test_connection=True)
     if not is_valid:
         logging.error(f"Invalid RTSP URL for {rtsp_id}: {msg}")
-        return
+        if not retry:
+            return
 
     logging.info(f"Adding source: {rtsp_id} -> {rtsp_url}")
 
-    success = run_adapter(message)
-    if success:
+    success, retry = run_adapter(message)
+    if success or retry:
         with dict_lock:
             active_sources[rtsp_id] = rtsp_url
         change_event.set()
-        logging.info(
-            f"Successfully added source {rtsp_id}. Active sources: {list(active_sources.keys())}"
-        )
+
+        if success:
+            logging.info(
+                f"Successfully added source {rtsp_id}. Active sources: {list(active_sources.keys())}"
+            )
+        else:
+            logging.info(f"Unable to add the new source {rtsp_id}. Will retry later.")
     else:
         logging.error(f"Failed to start adapter for {rtsp_url}")
         return
@@ -119,26 +126,30 @@ def remove_sources(message):
 
     logging.info(f"Removing source: {rtsp_id}")
 
-    success = stop_adapter(message)
-    if success:
+    success, retry = stop_adapter(message)
+    if success or retry:
         with dict_lock:
             active_sources.pop(rtsp_id, None)
         change_event.set()
-        logging.info(
-            f"Successfully removed source {rtsp_id}. Active sources: {list(active_sources.keys())}"
-        )
+
+        if success:
+            logging.info(
+                f"Successfully removed source {rtsp_id}. Active sources: {list(active_sources.keys())}"
+            )
+        else:
+            logging.info(f"Unable to remove the source {rtsp_id}. Will retry later.")
     else:
         logging.error(f"Failed to stop adapter for rtsp with id={rtsp_id}")
         return
 
 
-def run_adapter(message: dict):
+def run_adapter(message: dict) -> tuple[bool, bool]:
     rtsp_id = message.get("id")
     rtsp_url = message.get("rtsp")
 
     if not rtsp_id or not rtsp_url:
         logging.error("run_adapter: Missing 'id' or 'rtsp' in message")
-        return False
+        return False, False
 
     adapter_name = f"source-rtsp-{rtsp_id}"
     logging.info(f"Starting adapter for {rtsp_url} with ID: {rtsp_id}")
@@ -186,29 +197,34 @@ def run_adapter(message: dict):
 
         if result.returncode == 0:
             logging.info(f"Successfully started adapter: {adapter_name}")
-            return True
+            return True, False
+        elif "permission denied" in result.stderr:
+            logging.error(
+                f"Current user doesn't have access to Docker. Run this script in sudo mode or give your user access to Docker."
+            )
+            return False, False
         else:
             logging.error(
                 f"Failed to start adapter {adapter_name}. Stderr: {result.stderr.strip()}"
             )
-            return False
+            return False, True
 
     except FileNotFoundError:
         logging.error("Docker is not installed or not in PATH")
-        return False
+        return False, False
     except subprocess.TimeoutExpired:
         logging.error("Docker command timed out while starting adapter")
-        return False
+        return False, True
     except Exception as e:
         logging.exception(f"Unexpected error starting adapter {adapter_name}")
-        return False
+        return False, True
 
 
 def stop_adapter(message: dict):
     rtsp_id = message.get("id")
     if not rtsp_id:
         logging.error("stop_adapter: Missing 'id' in message")
-        return False
+        return False, False
 
     adapter_name = f"source-rtsp-{rtsp_id}"
     logging.info(f"Stopping adapter {adapter_name}")
@@ -231,22 +247,22 @@ def stop_adapter(message: dict):
         else:
             if "No such container" in result.stderr:
                 logging.warning(f"Container {adapter_name} was not running")
-                return True
+                return True, False
             else:
                 logging.error(
                     f"Failed to stop adapter {adapter_name}: {result.stderr.strip()}"
                 )
-                return False
+                return False, True
 
     except FileNotFoundError:
         logging.warning("Docker is not available")
-        return False
+        return False, False
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout while stopping adapter {adapter_name}")
-        return False
+        return False, True
     except Exception as e:
         logging.exception(f"Unexpected error stopping adapter {adapter_name}: {e}")
-        return False
+        return False, True
 
 
 def watch_kafka():
@@ -320,16 +336,65 @@ def watch_kafka():
             consumer = None
 
 
-def watch_sources():
-    global active_sources
+def handle_retry():
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            timeout=10,
+            text=True,
+        )
+        if result.returncode != 0:
+            logging.error(
+                f"Error while getting list of running adapters: {result.stderr}"
+            )
+            return
 
-    while True:
-        change_event.wait()
-
+        containers = result.stdout.strip().split("\n")
+        running_adapter_ids = set(
+            [c.split("-")[-1] for c in containers if c.startswith("source-rtsp-")]
+        )
         with dict_lock:
-            pass
+            rtsp_ids = set(active_sources.keys())
 
-        change_event.clear()
+        shutdown_adapters = rtsp_ids - running_adapter_ids
+        if len(untracked := running_adapter_ids - rtsp_ids):
+            logging.critical(
+                f"There are untracked adapters running:"
+                f"{['source-rtsp-' + u for u in untracked]}"
+            )
+
+        for rtsp_id in shutdown_adapters:
+            with dict_lock:
+                rtsp_url = active_sources.get(rtsp_id)
+
+            success, retry = run_adapter({"id": rtsp_id, "rtsp": rtsp_url})
+            if success or retry:
+                if success:
+                    logging.info(
+                        f"Successfully added source {rtsp_id} in retry. Active sources: {list(rtsp_ids)}"
+                    )
+                else:
+                    logging.info(
+                        f"Unable to add the new source {rtsp_id}. Will retry again later."
+                    )
+            else:
+                logging.error(f"Retry to start adapter for {rtsp_url} failed again")
+                return
+
+    except FileNotFoundError:
+        logging.error("Docker is not installed or not in PATH")
+    except subprocess.TimeoutExpired:
+        logging.error("Docker command timed out while retrying to run failed adapters")
+    except Exception as e:
+        logging.exception(
+            f"Unexpected error while retrying to run failed adapters: {e}"
+        )
+
+
+def watch_sources():
+    while True:
+        handle_retry()
 
 
 if __name__ == "__main__":
