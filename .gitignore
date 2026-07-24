@@ -11,3 +11,6 @@ wheels/
 
 *log
 mediamtx*
+active_sources.json
+auto.crt
+auto.key

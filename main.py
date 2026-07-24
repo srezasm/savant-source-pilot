@@ -1,18 +1,18 @@
 import json
 import time
 import logging
-import subprocess
 import threading
-import logging
-from urllib.parse import urlparse
 import subprocess
 from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
+from source_command import SourceCommand
 
 KAFKA_COMMANDS_TOPIC = "rtsp-source-commands"
 KAFKA_BOOTSTRAP_SERVER = "localhost:29092"
 
 STATE_FILE = "active_sources.json"
+RETRY_SECONDS = 5
+SOURCE_CONTAINER_PREFIX = "source-rtsp-"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -20,14 +20,18 @@ logging.basicConfig(
 
 change_event = threading.Event()
 dict_lock = threading.Lock()
-active_sources = {}
+active_sources: dict[str, SourceCommand] = {}
 
 
 def save_state():
     try:
+        with dict_lock:
+            snapshot = {
+                source_id: command.model_dump(mode="json")
+                for source_id, command in active_sources.items()
+            }
         with open(STATE_FILE, "w") as f:
-            with dict_lock:
-                json.dump(active_sources, f, indent=4)
+            json.dump(snapshot, f, indent=4)
     except Exception as e:
         logging.exception(
             f"Unexpected exception while trying to save final state into {STATE_FILE}: {e}"
@@ -37,94 +41,76 @@ def save_state():
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
-            with dict_lock:
-                active_sources = json.load(f)
-            logging.info(f"Loaded {len(active_sources)} from {STATE_FILE}")
+            raw_state = json.load(f)
+
+        loaded_sources: dict[str, SourceCommand] = {}
+        for source_id, payload in raw_state.items():
+            if isinstance(payload, dict):
+                loaded_sources[source_id] = SourceCommand.model_validate(payload)
+            else:
+                logging.warning(
+                    f"Skipping unsupported persisted state for source '{source_id}': {type(payload).__name__}"
+                )
+
+        with dict_lock:
+            active_sources.clear()
+            active_sources.update(loaded_sources)
+
+        logging.info(f"Loaded {len(active_sources)} from {STATE_FILE}")
     except FileNotFoundError:
         logging.info(f"Couldn't locate last state file {STATE_FILE}")
     except Exception as e:
         logging.exception(f"Failed to load last state from file {STATE_FILE}: {e}")
 
 
-def validate_rtsp_url(
-    rtsp_url: str, test_connection: bool = True
-) -> tuple[bool, bool, str]:
-    """
-    Validates RTSP URL. Can also test actual connection if test_connection=True.
-    """
-    if not rtsp_url or not isinstance(rtsp_url, str):
-        return False, False, "RTSP URL is empty or invalid type"
+def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
+    logging.info(f"Testing RTSP connection to: {rtsp_url}")
+    try:
+        # Use ffprobe (from ffmpeg) to test the stream
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                rtsp_url,
+            ],
+            capture_output=True,
+            timeout=10,
+        )
 
-    rtsp_url = rtsp_url.strip()
+        if result.returncode == 0:
+            logging.info(f"RTSP connection test successful: {rtsp_url}")
+            return True, False, "Valid and reachable"
+        else:
+            return False, True, f"Cannot connect to stream (ffprobe failed)"
 
-    if not rtsp_url.startswith("rtsp://"):
-        return False, False, "Must start with 'rtsp://'"
-
-    parsed = urlparse(rtsp_url)
-    if not parsed.netloc:
-        return False, False, "Missing host in URL"
-
-    if test_connection:
-        logging.info(f"Testing RTSP connection to: {rtsp_url}")
-        try:
-            # Use ffprobe (from ffmpeg) to test the stream
-            result = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "quiet",
-                    "-rtsp_transport",
-                    "tcp",
-                    "-i",
-                    rtsp_url,
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-
-            if result.returncode == 0:
-                logging.info(f"RTSP connection test successful: {rtsp_url}")
-                return True, False, "Valid and reachable"
-            else:
-                return False, True, f"Cannot connect to stream (ffprobe failed)"
-
-        except FileNotFoundError:
-            logging.warning("ffprobe not found. Skipping connection test.")
-            return True, False, "Format looks valid (ffprobe not available for testing)"
-        except subprocess.TimeoutExpired:
-            return False, True, "Connection test timed out"
-        except Exception as e:
-            return False, True, f"Connection test error: {str(e)}"
-
-    return True, "Format looks valid"
+    except FileNotFoundError:
+        logging.warning("ffprobe not found. Skipping connection test.")
+        return True, False, "Format looks valid (ffprobe not available for testing)"
+    except subprocess.TimeoutExpired:
+        return False, True, "Connection test timed out"
+    except Exception as e:
+        return False, True, f"Connection test error: {str(e)}"
 
 
-def add_sources(message):
-    rtsp_id = message.get("id")
-    rtsp_url = message.get("rtsp")
-
-    if rtsp_id is None or rtsp_url is None:
-        logging.error("Add message must contain 'id' and 'rtsp' keys")
-        return
+def add_sources(command: SourceCommand):
+    rtsp_id = command.source_id
+    rtsp_url = command.rtsp_url
 
     with dict_lock:
         if rtsp_id in active_sources:
             logging.warning(f"RTSP id '{rtsp_id}' already exists")
             return
 
-    # Validate RTSP
-    is_valid, retry, msg = validate_rtsp_url(rtsp_url, test_connection=True)
-    if not is_valid:
-        logging.error(f"Invalid RTSP URL for {rtsp_id}: {msg}")
-        if not retry:
-            return
-
     logging.info(f"Adding source: {rtsp_id} -> {rtsp_url}")
 
-    success, retry = run_adapter(message)
+    success, retry = run_adapter(command)
     if success or retry:
         with dict_lock:
-            active_sources[rtsp_id] = rtsp_url
+            active_sources[rtsp_id] = command
         change_event.set()
         save_state()  # Persist active_sources
 
@@ -139,12 +125,8 @@ def add_sources(message):
         return
 
 
-def remove_sources(message):
-    rtsp_id = message.get("id")
-
-    if rtsp_id is None:
-        logging.error("Remove message must contain 'id' key")
-        return
+def remove_sources(command: SourceCommand):
+    rtsp_id = command.source_id
 
     with dict_lock:
         if rtsp_id not in active_sources:
@@ -153,7 +135,7 @@ def remove_sources(message):
 
     logging.info(f"Removing source: {rtsp_id}")
 
-    success, retry = stop_adapter(message)
+    success, retry = stop_adapter(command)
     if success or retry:
         with dict_lock:
             active_sources.pop(rtsp_id, None)
@@ -171,15 +153,21 @@ def remove_sources(message):
         return
 
 
-def run_adapter(message: dict) -> tuple[bool, bool]:
-    rtsp_id = message.get("id")
-    rtsp_url = message.get("rtsp")
+def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
+    rtsp_id = command.source_id
+    rtsp_url = command.rtsp_url
 
     if not rtsp_id or not rtsp_url:
-        logging.error("run_adapter: Missing 'id' or 'rtsp' in message")
+        logging.error("run_adapter: Missing 'source_id' or 'rtsp_url' in command")
         return False, False
 
-    adapter_name = f"source-rtsp-{rtsp_id}"
+    # RTSP check
+    is_valid, retry, msg = check_rtsp_connection(rtsp_url)
+    if not is_valid:
+        logging.error(f"RTSP check {rtsp_url} failed: {msg}")
+        return False, retry
+
+    adapter_name = SOURCE_CONTAINER_PREFIX + rtsp_id
     logging.info(f"Starting adapter for {rtsp_url} with ID: {rtsp_id}")
 
     try:
@@ -211,7 +199,7 @@ def run_adapter(message: dict) -> tuple[bool, bool]:
                 "-e",
                 "ZMQ_ENDPOINT=dealer+connect:ipc:///tmp/zmq-sockets/input-video.ipc",
                 "-e",
-                "SOURCE_ID=test",
+                f"SOURCE_ID={rtsp_id}",
                 "-e",
                 f"RTSP_URI={rtsp_url}",
                 "-v",
@@ -244,17 +232,17 @@ def run_adapter(message: dict) -> tuple[bool, bool]:
         logging.error("Docker command timed out while starting adapter")
         return False, True
     except Exception as e:
-        logging.exception(f"Unexpected error starting adapter {adapter_name}")
+        logging.exception(f"Unexpected error starting adapter {adapter_name}: {e}")
         return False, True
 
 
-def stop_adapter(message: dict):
-    rtsp_id = message.get("id")
+def stop_adapter(command: SourceCommand):
+    rtsp_id = command.source_id
     if not rtsp_id:
-        logging.error("stop_adapter: Missing 'id' in message")
+        logging.error("stop_adapter: Missing 'source_id' in command")
         return False, False
 
-    adapter_name = f"source-rtsp-{rtsp_id}"
+    adapter_name = SOURCE_CONTAINER_PREFIX + rtsp_id
     logging.info(f"Stopping adapter {adapter_name}")
 
     try:
@@ -315,21 +303,26 @@ def watch_kafka():
             # Check if topic exists
             topics = consumer.topics()
             if KAFKA_COMMANDS_TOPIC not in topics:
-                logging.warning(f"Topic '{KAFKA_COMMANDS_TOPIC}' does not exist yet. Waiting...")
+                logging.warning(
+                    f"Topic '{KAFKA_COMMANDS_TOPIC}' does not exist yet. Waiting..."
+                )
                 time.sleep(10)
                 consumer.close()
                 continue  # Try again
-            logging.info(f"Topic '{KAFKA_COMMANDS_TOPIC}' found. Available topics: {sorted(topics)}")
+            logging.info(
+                f"Topic '{KAFKA_COMMANDS_TOPIC}' found. Available topics: {sorted(topics)}"
+            )
 
             for message in consumer:
                 try:
                     key = message.key
                     value = message.value
+                    command = SourceCommand.model_validate(value)
 
-                    if key == "add":
-                        add_sources(value)
-                    elif key == "remove":
-                        remove_sources(value)
+                    if command.type == "add":
+                        add_sources(command)
+                    elif command.type == "remove":
+                        remove_sources(command)
                     else:
                         logging.warning(f"Unknown key type: {key}")
 
@@ -338,6 +331,9 @@ def watch_kafka():
                 except json.JSONDecodeError as e:
                     logging.error(f"Malformed JSON in message: {message.offset}: {e}")
                     consumer.commit()
+                except ValueError as e:
+                    logging.error(f"Invalid message at offset {message.offset}: {e}")
+                    consumer.commit()  # Skip poison message
                 except Exception as e:
                     logging.exception(f"Error processing message: {message.offset}")
                     consumer.commit()  # To avoid infinite loop
@@ -372,23 +368,34 @@ def handle_retry():
 
         containers = result.stdout.strip().split("\n")
         running_adapter_ids = set(
-            [c.split("-")[-1] for c in containers if c.startswith("source-rtsp-")]
+            [
+                c.removeprefix(SOURCE_CONTAINER_PREFIX)
+                for c in containers
+                if c.startswith(SOURCE_CONTAINER_PREFIX)
+            ]
         )
         with dict_lock:
             rtsp_ids = set(active_sources.keys())
 
         shutdown_adapters = rtsp_ids - running_adapter_ids
         if len(untracked := running_adapter_ids - rtsp_ids):
+
             logging.critical(
                 f"There are untracked adapters running:"
-                f"{['source-rtsp-' + u for u in untracked]}"
+                f"{[SOURCE_CONTAINER_PREFIX + u for u in untracked]}"
             )
 
-        for rtsp_id in shutdown_adapters:
-            with dict_lock:
-                rtsp_url = active_sources.get(rtsp_id)
+        with dict_lock:
+            sources_to_retry = {
+                rtsp_id: active_sources.get(rtsp_id) for rtsp_id in shutdown_adapters
+            }
 
-            success, retry = run_adapter({"id": rtsp_id, "rtsp": rtsp_url})
+        for rtsp_id, command in sources_to_retry.items():
+            if command is None:
+                logging.warning(f"No persisted command found for source {rtsp_id}")
+                continue
+
+            success, retry = run_adapter(command)
             if success or retry:
                 if success:
                     logging.info(
@@ -399,7 +406,9 @@ def handle_retry():
                         f"Unable to add the new source {rtsp_id}. Will retry again later."
                     )
             else:
-                logging.error(f"Retry to start adapter for {rtsp_url} failed again")
+                logging.error(
+                    f"Retry to start adapter for {command.rtsp_url} failed again"
+                )
                 return
 
     except FileNotFoundError:
@@ -414,6 +423,7 @@ def handle_retry():
 
 def watch_sources():
     while True:
+        time.sleep(RETRY_SECONDS)
         handle_retry()
 
 
