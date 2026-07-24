@@ -9,7 +9,9 @@ import subprocess
 from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
 
-READ_KAFKA_TOPIC_FROM_BEGINNING = True
+KAFKA_READ_TOPIC_FROM_BEGINNING = True
+KAFKA_COMMANDS_TOPIC = "rtsp-source-commands"
+KAFKA_BOOTSTRAP_SERVER = "localhost:29092"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -272,8 +274,8 @@ def watch_kafka():
     while True:
         try:
             consumer = KafkaConsumer(
-                "sources",
-                bootstrap_servers=["localhost:29092"],
+                KAFKA_COMMANDS_TOPIC,
+                bootstrap_servers=[KAFKA_BOOTSTRAP_SERVER],
                 enable_auto_commit=False,
                 auto_offset_reset="earliest",
                 group_id="source-management",
@@ -286,7 +288,7 @@ def watch_kafka():
 
             # Check if topic exists
             topics = consumer.topics()
-            if "sources" not in topics:
+            if KAFKA_COMMANDS_TOPIC not in topics:
                 logging.warning(f"Topic 'sources' does not exist yet. Waiting...")
                 time.sleep(10)
                 consumer.close()
@@ -295,7 +297,7 @@ def watch_kafka():
 
             # Assign partition to consumer
             consumer.poll(timeout_ms=1000)
-            if READ_KAFKA_TOPIC_FROM_BEGINNING:
+            if KAFKA_READ_TOPIC_FROM_BEGINNING:
                 consumer.seek_to_beginning()
                 logging.info("Reset to beginning of topic")
 
