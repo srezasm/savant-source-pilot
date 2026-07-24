@@ -14,3 +14,5 @@ mediamtx*
 active_sources.json
 auto.crt
 auto.key
+TODO.md
+.env

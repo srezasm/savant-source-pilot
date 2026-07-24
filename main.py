@@ -154,21 +154,18 @@ def remove_sources(command: SourceCommand):
 
 
 def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
-    rtsp_id = command.source_id
-    rtsp_url = command.rtsp_url
-
-    if not rtsp_id or not rtsp_url:
+    if not command.source_id or not command.rtsp_url:
         logging.error("run_adapter: Missing 'source_id' or 'rtsp_url' in command")
         return False, False
 
     # RTSP check
-    is_valid, retry, msg = check_rtsp_connection(rtsp_url)
+    is_valid, retry, msg = check_rtsp_connection(command.rtsp_url)
     if not is_valid:
-        logging.error(f"RTSP check {rtsp_url} failed: {msg}")
+        logging.error(f"RTSP check {command.rtsp_url} failed: {msg}")
         return False, retry
 
-    adapter_name = SOURCE_CONTAINER_PREFIX + rtsp_id
-    logging.info(f"Starting adapter for {rtsp_url} with ID: {rtsp_id}")
+    adapter_name = SOURCE_CONTAINER_PREFIX + command.source_id
+    logging.info(f"Starting adapter {adapter_name} for {command.rtsp_url}")
 
     try:
         # Verify docker exists
@@ -184,28 +181,41 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
             timeout=5,
         )
 
+        adapter = command.adapter
+        env_vars = {
+            "ZMQ_ENDPOINT": adapter.zmq_endpoint,
+            "SOURCE_ID": command.source_id,
+            "RTSP_URI": command.rtsp_url,
+            **adapter.extra_env,
+        }
+
+        # Construct docker command
+        docker_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            adapter_name,
+            "--network",
+            adapter.network,
+            "--entrypoint",
+            adapter.entrypoint,
+        ]
+        # Add environment variables
+        for key, value in env_vars.items():
+            docker_cmd += ["-e", f"{key}={value}"]
+        # Add volumes
+        for volume in adapter.volumes:
+            docker_cmd += ["-v", volume]
+        # Add possible extra arguments
+        docker_cmd += adapter.extra_args
+        # Add adapter image
+        docker_cmd.append(adapter.image)
+
+        # Run docker command and capture the result
         result = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-d",
-                "--name",
-                adapter_name,
-                "--network",
-                "host",
-                "--entrypoint",
-                "/opt/savant/adapters/gst/sources/rtsp.sh",
-                "-e",
-                "ZMQ_ENDPOINT=dealer+connect:ipc:///tmp/zmq-sockets/input-video.ipc",
-                "-e",
-                f"SOURCE_ID={rtsp_id}",
-                "-e",
-                f"RTSP_URI={rtsp_url}",
-                "-v",
-                "/tmp/zmq-sockets:/tmp/zmq-sockets",
-                "ghcr.io/insight-platform/savant-adapters-gstreamer:0.6.0",
-            ],
+            docker_cmd,
             capture_output=True,
             timeout=30,
             text=True,
