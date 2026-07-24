@@ -42,6 +42,15 @@ class KafkaSettings(BaseSettings):
     bootstrap_server: str = "localhost:29092"
 
 
+class RedisSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", env_prefix="REDIS_", extra="ignore"
+    )
+
+    host: str = "localhost"
+    port: int = 6379
+
+
 class GeneralSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -54,4 +63,5 @@ class GeneralSettings(BaseSettings):
 
 adapter_settings = AdapterSettings()
 kafka_settings = KafkaSettings()
+redis_settings = RedisSettings()
 general_settings = GeneralSettings()

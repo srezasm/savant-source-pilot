@@ -7,56 +7,11 @@ from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
 from source_command import SourceCommand
 from settings import general_settings, kafka_settings
+import storage
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-change_event = threading.Event()
-dict_lock = threading.Lock()
-active_sources: dict[str, SourceCommand] = {}
-
-
-def save_state():
-    try:
-        with dict_lock:
-            snapshot = {
-                source_id: command.model_dump(mode="json")
-                for source_id, command in active_sources.items()
-            }
-        with open(general_settings.state_file, "w") as f:
-            json.dump(snapshot, f, indent=4)
-    except Exception as e:
-        logging.exception(
-            f"Unexpected exception while trying to save final state into {general_settings.state_file}: {e}"
-        )
-
-
-def load_state():
-    try:
-        with open(general_settings.state_file, "r") as f:
-            raw_state = json.load(f)
-
-        loaded_sources: dict[str, SourceCommand] = {}
-        for source_id, payload in raw_state.items():
-            if isinstance(payload, dict):
-                loaded_sources[source_id] = SourceCommand.model_validate(payload)
-            else:
-                logging.warning(
-                    f"Skipping unsupported persisted state for source '{source_id}': {type(payload).__name__}"
-                )
-
-        with dict_lock:
-            active_sources.clear()
-            active_sources.update(loaded_sources)
-
-        logging.info(f"Loaded {len(active_sources)} from {general_settings.state_file}")
-    except FileNotFoundError:
-        logging.info(f"Couldn't locate last state file {general_settings.state_file}")
-    except Exception as e:
-        logging.exception(
-            f"Failed to load last state from file {general_settings.state_file}: {e}"
-        )
 
 
 def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
@@ -93,59 +48,46 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
 
 
 def add_sources(command: SourceCommand):
-    rtsp_id = command.source_id
-    rtsp_url = command.rtsp_url
+    if storage.exists(command.source_id):
+        logging.warning(f"RTSP id '{command.source_id}' already exists")
+        return
 
-    with dict_lock:
-        if rtsp_id in active_sources:
-            logging.warning(f"RTSP id '{rtsp_id}' already exists")
-            return
-
-    logging.info(f"Adding source: {rtsp_id} -> {rtsp_url}")
+    logging.info(f"Adding source: {command.source_id} -> {command.rtsp_url}")
 
     success, retry = run_adapter(command)
     if success or retry:
-        with dict_lock:
-            active_sources[rtsp_id] = command
-        change_event.set()
-        save_state()  # Persist active_sources
+        storage.add(command)
 
         if success:
             logging.info(
-                f"Successfully added source {rtsp_id}. Active sources: {list(active_sources.keys())}"
+                f"Successfully added source {command.source_id}. Active sources: {storage.list_ids()}"
             )
         else:
-            logging.info(f"Unable to add the new source {rtsp_id}. Will retry later.")
+            logging.info(f"Unable to add the new source {command.source_id}. Will retry later.")
     else:
-        logging.error(f"Failed to start adapter for {rtsp_url}")
+        logging.error(f"Failed to start adapter for {command.rtsp_url}")
         return
 
 
 def remove_sources(command: SourceCommand):
-    rtsp_id = command.source_id
+    if not storage.exists(command.source_id):
+        logging.warning(f"RTSP id '{command.source_id}' does not exist")
+        return
 
-    with dict_lock:
-        if rtsp_id not in active_sources:
-            logging.warning(f"RTSP id '{rtsp_id}' does not exist")
-            return
-
-    logging.info(f"Removing source: {rtsp_id}")
+    logging.info(f"Removing source: {command.source_id}")
 
     success, retry = stop_adapter(command)
     if success or retry:
-        with dict_lock:
-            active_sources.pop(rtsp_id, None)
-        change_event.set()
-        save_state()  # Persist active_sources
+        storage.delete(command.source_id)
 
         if success:
             logging.info(
-                f"Successfully removed source {rtsp_id}. Active sources: {list(active_sources.keys())}"
+                f"Successfully removed source {command.source_id}. Active sources: {storage.list_ids()}"
             )
         else:
-            logging.info(f"Unable to remove the source {rtsp_id}. Will retry later.")
+            logging.info(f"Unable to remove the source {command.source_id}. Will retry later.")
     else:
-        logging.error(f"Failed to stop adapter for rtsp with id={rtsp_id}")
+        logging.error(f"Failed to stop adapter for source with id={command.source_id}")
         return
 
 
@@ -380,8 +322,7 @@ def handle_retry():
                 if c.startswith(general_settings.container_name_prefix)
             ]
         )
-        with dict_lock:
-            rtsp_ids = set(active_sources.keys())
+        rtsp_ids = set(storage.list_ids())
 
         shutdown_adapters = rtsp_ids - running_adapter_ids
         if len(untracked := running_adapter_ids - rtsp_ids):
@@ -391,14 +332,13 @@ def handle_retry():
                 f"{[general_settings.container_name_prefix + u for u in untracked]}"
             )
 
-        with dict_lock:
-            sources_to_retry = {
-                rtsp_id: active_sources.get(rtsp_id) for rtsp_id in shutdown_adapters
-            }
+        sources_to_retry = {
+            rtsp_id: storage.get(rtsp_id) for rtsp_id in shutdown_adapters
+        }
 
         for rtsp_id, command in sources_to_retry.items():
             if command is None:
-                logging.warning(f"No persisted command found for source {rtsp_id}")
+                logging.warning(f"No persisted command found for source '{rtsp_id}'")
                 continue
 
             success, retry = run_adapter(command)
@@ -434,9 +374,6 @@ def watch_sources():
 
 
 if __name__ == "__main__":
-    # Load active_sources from last persistent state
-    load_state()
-
     watch_kafka_thread = threading.Thread(
         target=watch_kafka, name="watch_kafka", daemon=True
     )
@@ -458,3 +395,5 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         logging.info("Shutting down...")
+    finally:
+        storage.close()
