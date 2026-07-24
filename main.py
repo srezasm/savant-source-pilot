@@ -9,9 +9,10 @@ import subprocess
 from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
 
-KAFKA_READ_TOPIC_FROM_BEGINNING = True
 KAFKA_COMMANDS_TOPIC = "rtsp-source-commands"
 KAFKA_BOOTSTRAP_SERVER = "localhost:29092"
+
+STATE_FILE = "active_sources.json"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -20,6 +21,29 @@ logging.basicConfig(
 change_event = threading.Event()
 dict_lock = threading.Lock()
 active_sources = {}
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            with dict_lock:
+                json.dump(active_sources, f, indent=4)
+    except Exception as e:
+        logging.exception(
+            f"Unexpected exception while trying to save final state into {STATE_FILE}: {e}"
+        )
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            with dict_lock:
+                active_sources = json.load(f)
+            logging.info(f"Loaded {len(active_sources)} from {STATE_FILE}")
+    except FileNotFoundError:
+        logging.info(f"Couldn't locate last state file {STATE_FILE}")
+    except Exception as e:
+        logging.exception(f"Failed to load last state from file {STATE_FILE}: {e}")
 
 
 def validate_rtsp_url(
@@ -102,6 +126,7 @@ def add_sources(message):
         with dict_lock:
             active_sources[rtsp_id] = rtsp_url
         change_event.set()
+        save_state()  # Persist active_sources
 
         if success:
             logging.info(
@@ -133,6 +158,7 @@ def remove_sources(message):
         with dict_lock:
             active_sources.pop(rtsp_id, None)
         change_event.set()
+        save_state()  # Persist active_sources
 
         if success:
             logging.info(
@@ -289,19 +315,11 @@ def watch_kafka():
             # Check if topic exists
             topics = consumer.topics()
             if KAFKA_COMMANDS_TOPIC not in topics:
-                logging.warning(f"Topic 'sources' does not exist yet. Waiting...")
+                logging.warning(f"Topic '{KAFKA_COMMANDS_TOPIC}' does not exist yet. Waiting...")
                 time.sleep(10)
                 consumer.close()
                 continue  # Try again
-            logging.info(f"Topic 'sources' found. Available topics: {sorted(topics)}")
-
-            # Assign partition to consumer
-            consumer.poll(timeout_ms=1000)
-            if KAFKA_READ_TOPIC_FROM_BEGINNING:
-                consumer.seek_to_beginning()
-                logging.info("Reset to beginning of topic")
-
-            logging.info("Kafka consumer connected successfully")
+            logging.info(f"Topic '{KAFKA_COMMANDS_TOPIC}' found. Available topics: {sorted(topics)}")
 
             for message in consumer:
                 try:
@@ -400,6 +418,9 @@ def watch_sources():
 
 
 if __name__ == "__main__":
+    # Load active_sources from last persistent state
+    load_state()
+
     watch_kafka_thread = threading.Thread(
         target=watch_kafka, name="watch_kafka", daemon=True
     )
