@@ -1,45 +1,9 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Literal, Optional, Dict, Any, List
 from datetime import datetime
 import re
 from urllib.parse import urlparse
-
-
-class AdapterSettings(BaseSettings):
-    """
-    Default adapter/docker settings, loaded from a .env file (or real
-    environment variables, which take precedence over .env).
-
-    These are the *defaults* used when a SourceCommand doesn't override
-    them via its `adapter` field.
-    """
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="ADAPTER_",
-        extra="ignore",
-    )
-
-    image: str = "ghcr.io/insight-platform/savant-adapters-gstreamer:0.6.0"
-    entrypoint: str = "/opt/savant/adapters/gst/sources/rtsp.sh"
-    network: str = "host"
-    zmq_endpoint: str = "dealer+connect:ipc:///tmp/zmq-sockets/input-video.ipc"
-    # comma-separated in .env, e.g. ADAPTER_VOLUMES=/tmp/zmq-sockets:/tmp/zmq-sockets,/etc/foo:/etc/foo
-    # Kept as a raw string (not List[str]) so pydantic-settings doesn't try
-    # to JSON-decode it; split into a list via the `volumes` property below.
-    volumes_raw: str = Field(
-        default="/tmp/zmq-sockets:/tmp/zmq-sockets", alias="ADAPTER_VOLUMES"
-    )
-
-    @property
-    def volumes(self) -> List[str]:
-        return [item.strip() for item in self.volumes_raw.split(",") if item.strip()]
-
-
-# Loaded once at import time; reused as the default source for AdapterConfig.
-adapter_settings = AdapterSettings()
+from settings import adapter_settings
 
 
 class AdapterConfig(BaseModel):

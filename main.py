@@ -6,13 +6,7 @@ import subprocess
 from kafka import KafkaConsumer
 from kafka.errors import KafkaConnectionError, NoBrokersAvailable
 from source_command import SourceCommand
-
-KAFKA_COMMANDS_TOPIC = "rtsp-source-commands"
-KAFKA_BOOTSTRAP_SERVER = "localhost:29092"
-
-STATE_FILE = "active_sources.json"
-RETRY_SECONDS = 5
-SOURCE_CONTAINER_PREFIX = "source-rtsp-"
+from settings import general_settings, kafka_settings
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -30,17 +24,17 @@ def save_state():
                 source_id: command.model_dump(mode="json")
                 for source_id, command in active_sources.items()
             }
-        with open(STATE_FILE, "w") as f:
+        with open(general_settings.state_file, "w") as f:
             json.dump(snapshot, f, indent=4)
     except Exception as e:
         logging.exception(
-            f"Unexpected exception while trying to save final state into {STATE_FILE}: {e}"
+            f"Unexpected exception while trying to save final state into {general_settings.state_file}: {e}"
         )
 
 
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(general_settings.state_file, "r") as f:
             raw_state = json.load(f)
 
         loaded_sources: dict[str, SourceCommand] = {}
@@ -56,11 +50,13 @@ def load_state():
             active_sources.clear()
             active_sources.update(loaded_sources)
 
-        logging.info(f"Loaded {len(active_sources)} from {STATE_FILE}")
+        logging.info(f"Loaded {len(active_sources)} from {general_settings.state_file}")
     except FileNotFoundError:
-        logging.info(f"Couldn't locate last state file {STATE_FILE}")
+        logging.info(f"Couldn't locate last state file {general_settings.state_file}")
     except Exception as e:
-        logging.exception(f"Failed to load last state from file {STATE_FILE}: {e}")
+        logging.exception(
+            f"Failed to load last state from file {general_settings.state_file}: {e}"
+        )
 
 
 def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
@@ -164,7 +160,7 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
         logging.error(f"RTSP check {command.rtsp_url} failed: {msg}")
         return False, retry
 
-    adapter_name = SOURCE_CONTAINER_PREFIX + command.source_id
+    adapter_name = general_settings.container_name_prefix + command.source_id
     logging.info(f"Starting adapter {adapter_name} for {command.rtsp_url}")
 
     try:
@@ -252,7 +248,7 @@ def stop_adapter(command: SourceCommand):
         logging.error("stop_adapter: Missing 'source_id' in command")
         return False, False
 
-    adapter_name = SOURCE_CONTAINER_PREFIX + rtsp_id
+    adapter_name = general_settings.container_name_prefix + rtsp_id
     logging.info(f"Stopping adapter {adapter_name}")
 
     try:
@@ -298,8 +294,8 @@ def watch_kafka():
     while True:
         try:
             consumer = KafkaConsumer(
-                KAFKA_COMMANDS_TOPIC,
-                bootstrap_servers=[KAFKA_BOOTSTRAP_SERVER],
+                kafka_settings.commands_topic,
+                bootstrap_servers=[kafka_settings.bootstrap_server],
                 enable_auto_commit=False,
                 auto_offset_reset="earliest",
                 group_id="source-management",
@@ -312,15 +308,15 @@ def watch_kafka():
 
             # Check if topic exists
             topics = consumer.topics()
-            if KAFKA_COMMANDS_TOPIC not in topics:
+            if kafka_settings.commands_topic not in topics:
                 logging.warning(
-                    f"Topic '{KAFKA_COMMANDS_TOPIC}' does not exist yet. Waiting..."
+                    f"Topic '{kafka_settings.commands_topic}' does not exist yet. Waiting..."
                 )
                 time.sleep(10)
                 consumer.close()
                 continue  # Try again
             logging.info(
-                f"Topic '{KAFKA_COMMANDS_TOPIC}' found. Available topics: {sorted(topics)}"
+                f"Topic '{kafka_settings.commands_topic}' found. Available topics: {sorted(topics)}"
             )
 
             for message in consumer:
@@ -379,9 +375,9 @@ def handle_retry():
         containers = result.stdout.strip().split("\n")
         running_adapter_ids = set(
             [
-                c.removeprefix(SOURCE_CONTAINER_PREFIX)
+                c.removeprefix(general_settings.container_name_prefix)
                 for c in containers
-                if c.startswith(SOURCE_CONTAINER_PREFIX)
+                if c.startswith(general_settings.container_name_prefix)
             ]
         )
         with dict_lock:
@@ -392,7 +388,7 @@ def handle_retry():
 
             logging.critical(
                 f"There are untracked adapters running:"
-                f"{[SOURCE_CONTAINER_PREFIX + u for u in untracked]}"
+                f"{[general_settings.container_name_prefix + u for u in untracked]}"
             )
 
         with dict_lock:
@@ -433,7 +429,7 @@ def handle_retry():
 
 def watch_sources():
     while True:
-        time.sleep(RETRY_SECONDS)
+        time.sleep(general_settings.retry_seconds)
         handle_retry()
 
 
