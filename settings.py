@@ -40,6 +40,7 @@ class KafkaSettings(BaseSettings):
 
     commands_topic: str = "rtsp-source-commands"
     bootstrap_server: str = "localhost:29092"
+    group_id: str = "source-management"
 
 
 class RedisSettings(BaseSettings):

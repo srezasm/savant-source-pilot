@@ -3,6 +3,8 @@ from settings import redis_settings
 from source_command import SourceCommand
 import logging
 
+logger = logging.getLogger(__name__)
+
 client = redis.Redis(
     host=redis_settings.host,
     port=redis_settings.port,
@@ -13,18 +15,23 @@ client = redis.Redis(
     max_connections=10,
 )
 
+
 def add(command: SourceCommand):
     client.set(f"sources:active:{command.source_id}", command.model_dump_json())
+
 
 def delete(source_id: str):
     client.delete(f"sources:active:{source_id}")
 
+
 def exists(source_id: str) -> bool:
     return client.exists(f"sources:active:{source_id}") == 1
+
 
 def list_ids() -> list[str]:
     keys = client.keys("sources:active:*")
     return [key.removeprefix("sources:active:") for key in keys]
+
 
 def get(source_id: str) -> SourceCommand | None:
     command_json = client.get(f"sources:active:{source_id}")
@@ -32,11 +39,11 @@ def get(source_id: str) -> SourceCommand | None:
         return None
     return SourceCommand.model_validate_json(command_json)
 
+
 def close():
     if client:
         try:
             client.close()
-            client = None
-            logging.info("Redis connection closed")
+            logger.info("Redis connection closed")
         except Exception as e:
-            logging.error(f"Error closing Redis: {e}")
+            logger.error(f"Error closing Redis: {e}")

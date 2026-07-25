@@ -1,21 +1,24 @@
 import json
 import time
+import signal
 import logging
 import threading
 import subprocess
-from kafka import KafkaConsumer
-from kafka.errors import KafkaConnectionError, NoBrokersAvailable
+from contextlib import ExitStack
+import storage
+from kafka_service import KafkaService
+from health_service import HealthService
 from source_command import SourceCommand
 from settings import general_settings, kafka_settings
-import storage
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
 
 def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
-    logging.info(f"Testing RTSP connection to: {rtsp_url}")
+    logger.info(f"Testing RTSP connection to: {rtsp_url}")
     try:
         # Use ffprobe (from ffmpeg) to test the stream
         result = subprocess.run(
@@ -33,13 +36,13 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
         )
 
         if result.returncode == 0:
-            logging.info(f"RTSP connection test successful: {rtsp_url}")
+            logger.info(f"RTSP connection test successful: {rtsp_url}")
             return True, False, "Valid and reachable"
         else:
             return False, True, f"Cannot connect to stream (ffprobe failed)"
 
     except FileNotFoundError:
-        logging.warning("ffprobe not found. Skipping connection test.")
+        logger.warning("ffprobe not found. Skipping connection test.")
         return True, False, "Format looks valid (ffprobe not available for testing)"
     except subprocess.TimeoutExpired:
         return False, True, "Connection test timed out"
@@ -49,61 +52,65 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
 
 def add_sources(command: SourceCommand):
     if storage.exists(command.source_id):
-        logging.warning(f"RTSP id '{command.source_id}' already exists")
+        logger.warning(f"RTSP id '{command.source_id}' already exists")
         return
 
-    logging.info(f"Adding source: {command.source_id} -> {command.rtsp_url}")
+    logger.info(f"Adding source: {command.source_id} -> {command.rtsp_url}")
 
     success, retry = run_adapter(command)
     if success or retry:
         storage.add(command)
 
         if success:
-            logging.info(
+            logger.info(
                 f"Successfully added source {command.source_id}. Active sources: {storage.list_ids()}"
             )
         else:
-            logging.info(f"Unable to add the new source {command.source_id}. Will retry later.")
+            logger.info(
+                f"Unable to add the new source {command.source_id}. Will retry later."
+            )
     else:
-        logging.error(f"Failed to start adapter for {command.rtsp_url}")
+        logger.error(f"Failed to start adapter for {command.rtsp_url}")
         return
 
 
 def remove_sources(command: SourceCommand):
     if not storage.exists(command.source_id):
-        logging.warning(f"RTSP id '{command.source_id}' does not exist")
+        logger.warning(f"RTSP id '{command.source_id}' does not exist")
         return
 
-    logging.info(f"Removing source: {command.source_id}")
+    logger.info(f"Removing source: {command.source_id}")
 
     success, retry = stop_adapter(command)
     if success or retry:
         storage.delete(command.source_id)
 
         if success:
-            logging.info(
+            logger.info(
                 f"Successfully removed source {command.source_id}. Active sources: {storage.list_ids()}"
             )
         else:
-            logging.info(f"Unable to remove the source {command.source_id}. Will retry later.")
+            logger.info(
+                f"Unable to remove the source {command.source_id}. Will retry later."
+            )
     else:
-        logging.error(f"Failed to stop adapter for source with id={command.source_id}")
+        logger.error(f"Failed to stop adapter for source with id={command.source_id}")
         return
 
 
 def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
     if not command.source_id or not command.rtsp_url:
-        logging.error("run_adapter: Missing 'source_id' or 'rtsp_url' in command")
+        logger.error("run_adapter: Missing 'source_id' or 'rtsp_url' in command")
         return False, False
 
     # RTSP check
     is_valid, retry, msg = check_rtsp_connection(command.rtsp_url)
     if not is_valid:
-        logging.error(f"RTSP check {command.rtsp_url} failed: {msg}")
+        logger.error(f"RTSP check {command.rtsp_url} failed: {msg}")
         return False, retry
 
     adapter_name = general_settings.container_name_prefix + command.source_id
-    logging.info(f"Starting adapter {adapter_name} for {command.rtsp_url}")
+    logger.info(f"Starting adapter {adapter_name} for {command.rtsp_url}")
 
     try:
         # Verify docker exists
@@ -160,38 +167,38 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
         )
 
         if result.returncode == 0:
-            logging.info(f"Successfully started adapter: {adapter_name}")
+            logger.info(f"Successfully started adapter: {adapter_name}")
             return True, False
         elif "permission denied" in result.stderr:
-            logging.error(
+            logger.error(
                 f"Current user doesn't have access to Docker. Run this script in sudo mode or give your user access to Docker."
             )
             return False, False
         else:
-            logging.error(
+            logger.error(
                 f"Failed to start adapter {adapter_name}. Stderr: {result.stderr.strip()}"
             )
             return False, True
 
     except FileNotFoundError:
-        logging.error("Docker is not installed or not in PATH")
+        logger.error("Docker is not installed or not in PATH")
         return False, False
     except subprocess.TimeoutExpired:
-        logging.error("Docker command timed out while starting adapter")
+        logger.error("Docker command timed out while starting adapter")
         return False, True
     except Exception as e:
-        logging.exception(f"Unexpected error starting adapter {adapter_name}: {e}")
+        logger.exception(f"Unexpected error starting adapter {adapter_name}: {e}")
         return False, True
 
 
 def stop_adapter(command: SourceCommand):
     rtsp_id = command.source_id
     if not rtsp_id:
-        logging.error("stop_adapter: Missing 'source_id' in command")
+        logger.error("stop_adapter: Missing 'source_id' in command")
         return False, False
 
     adapter_name = general_settings.container_name_prefix + rtsp_id
-    logging.info(f"Stopping adapter {adapter_name}")
+    logger.info(f"Stopping adapter {adapter_name}")
 
     try:
         result = subprocess.run(
@@ -206,194 +213,81 @@ def stop_adapter(command: SourceCommand):
         )
 
         if result.returncode == 0:
-            logging.info(f"Successfully stopped adapter: {adapter_name}")
+            logger.info(f"Successfully stopped adapter: {adapter_name}")
             return True
         else:
             if "No such container" in result.stderr:
-                logging.warning(f"Container {adapter_name} was not running")
+                logger.warning(f"Container {adapter_name} was not running")
                 return True, False
             else:
-                logging.error(
+                logger.error(
                     f"Failed to stop adapter {adapter_name}: {result.stderr.strip()}"
                 )
                 return False, True
 
     except FileNotFoundError:
-        logging.warning("Docker is not available")
+        logger.warning("Docker is not available")
         return False, False
     except subprocess.TimeoutExpired:
-        logging.error(f"Timeout while stopping adapter {adapter_name}")
+        logger.error(f"Timeout while stopping adapter {adapter_name}")
         return False, True
     except Exception as e:
-        logging.exception(f"Unexpected error stopping adapter {adapter_name}: {e}")
+        logger.exception(f"Unexpected error stopping adapter {adapter_name}: {e}")
         return False, True
 
 
-def watch_kafka():
-    consumer = None
-    retry_delay = 5  # seconds
-
-    while True:
-        try:
-            consumer = KafkaConsumer(
-                kafka_settings.commands_topic,
-                bootstrap_servers=[kafka_settings.bootstrap_server],
-                enable_auto_commit=False,
-                auto_offset_reset="earliest",
-                group_id="source-management",
-                session_timeout_ms=30000,  # max time between heartbeats
-                request_timeout_ms=40000,  # max waiting time for response from broker
-                max_poll_interval_ms=60000,  # max time between two polls(processing messages)
-                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-                key_deserializer=lambda k: k.decode("utf-8"),
-            )
-
-            # Check if topic exists
-            topics = consumer.topics()
-            if kafka_settings.commands_topic not in topics:
-                logging.warning(
-                    f"Topic '{kafka_settings.commands_topic}' does not exist yet. Waiting..."
-                )
-                time.sleep(10)
-                consumer.close()
-                continue  # Try again
-            logging.info(
-                f"Topic '{kafka_settings.commands_topic}' found. Available topics: {sorted(topics)}"
-            )
-
-            for message in consumer:
-                try:
-                    key = message.key
-                    value = message.value
-                    command = SourceCommand.model_validate(value)
-
-                    if command.type == "add":
-                        add_sources(command)
-                    elif command.type == "remove":
-                        remove_sources(command)
-                    else:
-                        logging.warning(f"Unknown key type: {key}")
-
-                    consumer.commit()
-
-                except json.JSONDecodeError as e:
-                    logging.error(f"Malformed JSON in message: {message.offset}: {e}")
-                    consumer.commit()
-                except ValueError as e:
-                    logging.error(f"Invalid message at offset {message.offset}: {e}")
-                    consumer.commit()  # Skip poison message
-                except Exception as e:
-                    logging.exception(f"Error processing message: {message.offset}")
-                    consumer.commit()  # To avoid infinite loop
-
-        except (KafkaConnectionError, NoBrokersAvailable) as e:
-            logging.error(
-                f"Kafka connection error: {e}. Reconnecting in {retry_delay}s..."
-            )
-            time.sleep(retry_delay)
-        except Exception as e:
-            logging.exception(f"Unexpected error in Kafka consumer: {e}")
-            time.sleep(retry_delay)
-        finally:
-            if consumer:
-                consumer.close()
-            consumer = None
-
-
-def handle_retry():
+def on_message(record, service: KafkaService):
     try:
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
-            capture_output=True,
-            timeout=10,
-            text=True,
-        )
-        if result.returncode != 0:
-            logging.error(
-                f"Error while getting list of running adapters: {result.stderr}"
-            )
-            return
+        command = SourceCommand.model_validate_json(record.value)
 
-        containers = result.stdout.strip().split("\n")
-        running_adapter_ids = set(
-            [
-                c.removeprefix(general_settings.container_name_prefix)
-                for c in containers
-                if c.startswith(general_settings.container_name_prefix)
-            ]
-        )
-        rtsp_ids = set(storage.list_ids())
+        if command.type == "add":
+            add_sources(command)
+        elif command.type == "remove":
+            remove_sources(command)
+        else:
+            logger.warning(f"Unknown key type: {record.key}")
 
-        shutdown_adapters = rtsp_ids - running_adapter_ids
-        if len(untracked := running_adapter_ids - rtsp_ids):
-
-            logging.critical(
-                f"There are untracked adapters running:"
-                f"{[general_settings.container_name_prefix + u for u in untracked]}"
-            )
-
-        sources_to_retry = {
-            rtsp_id: storage.get(rtsp_id) for rtsp_id in shutdown_adapters
-        }
-
-        for rtsp_id, command in sources_to_retry.items():
-            if command is None:
-                logging.warning(f"No persisted command found for source '{rtsp_id}'")
-                continue
-
-            success, retry = run_adapter(command)
-            if success or retry:
-                if success:
-                    logging.info(
-                        f"Successfully added source {rtsp_id} in retry. Active sources: {list(rtsp_ids)}"
-                    )
-                else:
-                    logging.info(
-                        f"Unable to add the new source {rtsp_id}. Will retry again later."
-                    )
-            else:
-                logging.error(
-                    f"Retry to start adapter for {command.rtsp_url} failed again"
-                )
-                return
-
-    except FileNotFoundError:
-        logging.error("Docker is not installed or not in PATH")
-    except subprocess.TimeoutExpired:
-        logging.error("Docker command timed out while retrying to run failed adapters")
+    except json.JSONDecodeError as e:
+        logger.error(f"Malformed JSON in message: {record.offset}: {e}")
+    except ValueError as e:
+        logger.error(f"Invalid message at offset {record.offset}: {e}")
     except Exception as e:
-        logging.exception(
-            f"Unexpected error while retrying to run failed adapters: {e}"
-        )
+        logger.exception(f"Error processing message: {record.offset}")
 
 
-def watch_sources():
-    while True:
-        time.sleep(general_settings.retry_seconds)
-        handle_retry()
+def main():
+    shutdown_event = threading.Event()
+
+    kafka_service = KafkaService(
+        consume_topics=[kafka_settings.commands_topic],
+        bootstrap_servers=kafka_settings.bootstrap_server,
+        group_id=kafka_settings.group_id,
+        on_message=on_message,
+    )
+    health_service = HealthService(run_source=run_adapter)
+
+    def handle_signal(signum, frame):
+        logger.info("Received signal %s, shutting down...", signum)
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    with ExitStack() as stack:
+        stack.enter_context(kafka_service)
+        stack.enter_context(health_service)
+
+        logger.info("Services started. Press Ctrl+C to stop.")
+
+        while not shutdown_event.is_set():
+            if not kafka_service.is_running() or not health_service.is_running():
+                logger.error("A service died unexpectedly, shutting down...")
+                break
+
+            shutdown_event.wait(timeout=0.5)
+
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    watch_kafka_thread = threading.Thread(
-        target=watch_kafka, name="watch_kafka", daemon=True
-    )
-    watch_sources_thread = threading.Thread(
-        target=watch_sources, name="watch_sources", daemon=True
-    )
-
-    watch_kafka_thread.start()
-    watch_sources_thread.start()
-
-    try:
-        while True:
-            watch_kafka_thread.join(timeout=1.0)
-            watch_sources_thread.join(timeout=1.0)
-
-            if not watch_kafka_thread.is_alive() or not watch_sources_thread.is_alive():
-                logging.error("One of the watcher threads died. Shutting down.")
-                break
-
-    except KeyboardInterrupt:
-        logging.info("Shutting down...")
-    finally:
-        storage.close()
+    main()
