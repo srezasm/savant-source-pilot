@@ -1,15 +1,15 @@
 import json
-import time
 import signal
 import logging
 import threading
 import subprocess
+from functools import partial
 from contextlib import ExitStack
-import storage
+from storage import SourceStore
 from kafka_service import KafkaService
 from health_service import HealthService
 from source_command import SourceCommand
-from settings import general_settings, kafka_settings
+from settings import general_settings, kafka_settings, redis_settings
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -50,7 +50,7 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
         return False, True, f"Connection test error: {str(e)}"
 
 
-def add_sources(command: SourceCommand):
+def add_sources(command: SourceCommand, storage: SourceStore):
     if storage.exists(command.source_id):
         logger.warning(f"RTSP id '{command.source_id}' already exists")
         return
@@ -74,7 +74,7 @@ def add_sources(command: SourceCommand):
         return
 
 
-def remove_sources(command: SourceCommand):
+def remove_sources(command: SourceCommand, storage: SourceStore):
     if not storage.exists(command.source_id):
         logger.warning(f"RTSP id '{command.source_id}' does not exist")
         return
@@ -236,14 +236,14 @@ def stop_adapter(command: SourceCommand):
         return False, True
 
 
-def on_message(record, service: KafkaService):
+def on_message(record, service: KafkaService, storage: SourceStore):
     try:
         command = SourceCommand.model_validate_json(record.value)
 
         if command.type == "add":
-            add_sources(command)
+            add_sources(command, storage)
         elif command.type == "remove":
-            remove_sources(command)
+            remove_sources(command, storage)
         else:
             logger.warning(f"Unknown key type: {record.key}")
 
@@ -258,13 +258,19 @@ def on_message(record, service: KafkaService):
 def main():
     shutdown_event = threading.Event()
 
+    source_store = SourceStore(redis_settings.host, redis_settings.port)
     kafka_service = KafkaService(
         consume_topics=[kafka_settings.commands_topic],
         bootstrap_servers=kafka_settings.bootstrap_server,
         group_id=kafka_settings.group_id,
-        on_message=on_message,
+        on_message=partial(on_message, storage=source_store),
     )
-    health_service = HealthService(run_source=run_adapter)
+    health_service = HealthService(
+        retry_seconds=general_settings.retry_seconds,
+        container_name_prefix=general_settings.container_name_prefix,
+        storage=source_store,
+        run_source=run_adapter,
+    )
 
     def handle_signal(signum, frame):
         logger.info("Received signal %s, shutting down...", signum)
@@ -274,6 +280,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     with ExitStack() as stack:
+        stack.enter_context(source_store)
         stack.enter_context(kafka_service)
         stack.enter_context(health_service)
 

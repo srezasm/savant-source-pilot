@@ -1,13 +1,10 @@
-from kafka import KafkaProducer, KafkaConsumer
 import time
-import threading
-from typing import Callable, Optional
-from source_command import SourceCommand
 import logging
+import threading
 import subprocess
-from settings import general_settings
-import storage
-import json
+from typing import Callable, Optional
+from storage import SourceStore
+from source_command import SourceCommand
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +12,14 @@ logger = logging.getLogger(__name__)
 class HealthService:
     def __init__(
         self,
+        retry_seconds: int,
+        container_name_prefix: str,
+        storage: SourceStore,
         run_source: Callable[[SourceCommand], list[bool]],
     ):
+        self.retry_seconds = retry_seconds
+        self.container_name_prefix = container_name_prefix
+        self.storage = storage
         self.run_source = run_source
 
         self._thread: Optional[threading.Thread] = None
@@ -39,41 +42,39 @@ class HealthService:
             containers = result.stdout.strip().split("\n")
             running_adapter_ids = set(
                 [
-                    c.removeprefix(general_settings.container_name_prefix)
+                    c.removeprefix(self.container_name_prefix)
                     for c in containers
-                    if c.startswith(general_settings.container_name_prefix)
+                    if c.startswith(self.container_name_prefix)
                 ]
             )
-            rtsp_ids = set(storage.list_ids())
+            active_source_ids = set(self.storage.list_ids())
 
-            shutdown_adapters = rtsp_ids - running_adapter_ids
-            if len(untracked := running_adapter_ids - rtsp_ids):
+            sources_needing_retry = active_source_ids - running_adapter_ids
+            if len(untracked := running_adapter_ids - active_source_ids):
 
                 logging.critical(
                     f"There are untracked adapters running:"
-                    f"{[general_settings.container_name_prefix + u for u in untracked]}"
+                    f"{[self.container_name_prefix + u for u in untracked]}"
                 )
 
             sources_to_retry = {
-                rtsp_id: storage.get(rtsp_id) for rtsp_id in shutdown_adapters
+                src_id: self.storage.get(src_id) for src_id in sources_needing_retry
             }
 
-            for rtsp_id, command in sources_to_retry.items():
+            for src_id, command in sources_to_retry.items():
                 if command is None:
-                    logging.warning(
-                        f"No persisted command found for source '{rtsp_id}'"
-                    )
+                    logging.warning(f"No persisted command found for source '{src_id}'")
                     continue
 
                 success, retry = self.run_source(command)
                 if success or retry:
                     if success:
                         logging.info(
-                            f"Successfully added source {rtsp_id} in retry. Active sources: {list(rtsp_ids)}"
+                            f"Successfully added source {src_id} in retry. Active sources: {list(active_source_ids)}"
                         )
                     else:
                         logging.info(
-                            f"Unable to add the new source {rtsp_id}. Will retry again later."
+                            f"Unable to add the new source {src_id}. Will retry again later."
                         )
                 else:
                     logging.error(
@@ -94,7 +95,7 @@ class HealthService:
 
     def _watch_sources(self):
         while True:
-            time.sleep(general_settings.retry_seconds)
+            time.sleep(self.retry_seconds)
             self._handle_retry()
 
     def start(self):

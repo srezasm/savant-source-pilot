@@ -1,9 +1,9 @@
-from kafka import KafkaProducer, KafkaConsumer
 import time
+import json
+import logging
 import threading
 from typing import Callable, Optional
-import logging
-import json
+from kafka import KafkaProducer, KafkaConsumer
 
 logger = logging.getLogger(__name__)
 
