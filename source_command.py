@@ -73,7 +73,7 @@ class SourceCommand(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["add", "remove", "update"] = Field(
+    type: Literal["add", "remove"] = Field(
         ..., description="Type of operation"
     )
 
@@ -83,7 +83,7 @@ class SourceCommand(BaseModel):
     )
 
     rtsp_url: Optional[str] = Field(
-        None, description="RTSP URL (required for add and update)"
+        None, description="RTSP URL (required for add)"
     )
 
     timestamp: datetime = Field(
@@ -92,9 +92,9 @@ class SourceCommand(BaseModel):
     )
 
     adapter: Optional[AdapterConfig] = Field(
-        default_factory=AdapterConfig,
+        None,
         description="Docker/adapter-level configuration (image, network, "
-        "volumes, extra env vars, etc.). Only relevant for 'add'/'update'; "
+        "volumes, extra env vars, etc.). Only relevant for 'add'; "
         "defaults to values from .env if not overridden.",
     )
 
@@ -113,7 +113,7 @@ class SourceCommand(BaseModel):
 
     @model_validator(mode="after")
     def validate_rtsp_url_for_type(self):
-        if self.type in ("add", "update") and not self.rtsp_url:
+        if self.type == "add" and not self.rtsp_url:
             raise ValueError(f"rtsp_url is required when type is '{self.type}'")
 
         if self.type == "remove":
@@ -124,6 +124,17 @@ class SourceCommand(BaseModel):
                     "adapter config is not applicable when type is 'remove'"
                 )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_by_type(self):
+        if self.type == "add":
+            if not self.rtsp_url:
+                raise ValueError(f"rtsp_url is required when type is '{self.type}'")
+            self.adapter = self.adapter or AdapterConfig()
+        else:
+            self.rtsp_url = None
+            self.adapter = None
         return self
 
     @field_validator("rtsp_url")

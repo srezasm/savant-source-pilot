@@ -19,8 +19,8 @@ class HealthService:
         container_name_prefix: str,
         storage: SourceStore,
         kafka_service: KafkaService,
-        run_source: Callable[[SourceCommand], list[bool]],
-        remove_source: Callable[[SourceCommand], list[bool]],
+        run_source: Callable[[SourceCommand], tuple[bool, bool]],
+        remove_source: Callable[[str], tuple[bool, bool]],
     ):
         self.retry_seconds = retry_seconds
         self.container_name_prefix = container_name_prefix
@@ -58,11 +58,8 @@ class HealthService:
 
             # Remove untracked containers that are running but not in storage
             untracked_source_ids = running_adapter_ids - active_source_ids
-            sources_to_remove = {
-                src_id: self.storage.get(src_id) for src_id in untracked_source_ids
-            }
-            for src_id, command in sources_to_remove.items():
-                success, retry = self.remove_source(command)
+            for src_id in untracked_source_ids:
+                success, retry = self.remove_source(src_id)
                 if success:
                     logger.info(f"Successfully removed source {src_id}")
                     self.kafka_service.produce(
@@ -125,8 +122,7 @@ class HealthService:
             )
 
     def _watch_sources(self):
-        while True:
-            time.sleep(self.retry_seconds)
+        while not self._stop_event.wait(self.retry_seconds):
             self._handle_retry()
 
     def start(self):

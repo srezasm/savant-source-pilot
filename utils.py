@@ -1,5 +1,6 @@
-from datetime import datetime
 from typing import Literal
+from datetime import datetime
+from urllib.parse import urlparse
 
 
 def gen_stat_msg(
@@ -27,3 +28,10 @@ def gen_stat_msg(
         A dictionary containing the status string and the current timestamp.
     """
     return {"status": status, "timestamp": str(datetime.now())}
+
+
+def redact_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        return url.replace(parsed.netloc, f"***@{parsed.hostname}")
+    return url

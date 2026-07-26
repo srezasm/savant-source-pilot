@@ -5,6 +5,7 @@ import threading
 import subprocess
 from functools import partial
 from contextlib import ExitStack
+from utils import *
 from settings import *
 from utils import gen_stat_msg
 from storage import SourceStore
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
-    logger.info(f"Testing RTSP connection to: {rtsp_url}")
+    logger.info(f"Testing RTSP connection to: {redact_url(rtsp_url)}")
     try:
         # Use ffprobe (from ffmpeg) to test the stream
         result = subprocess.run(
@@ -58,7 +59,9 @@ def add_sources(
         logger.warning(f"RTSP id '{command.source_id}' already exists")
         return
 
-    logger.info(f"Adding source: {command.source_id} -> {command.rtsp_url}")
+    logger.info(
+        f"Adding source: {command.source_id} -> {redact_url( command.rtsp_url)}"
+    )
 
     success, retry = run_adapter(command)
     if success or retry:
@@ -79,7 +82,7 @@ def add_sources(
                 kafka_settings.status_topic, gen_stat_msg("faulted"), command.source_id
             )
     else:
-        logger.error(f"Failed to start adapter for {command.rtsp_url}")
+        logger.error(f"Failed to start adapter for {redact_url( command.rtsp_url)}")
         kafka_service.produce(
             kafka_settings.status_topic, gen_stat_msg("aborted"), command.source_id
         )
@@ -95,7 +98,7 @@ def remove_sources(
 
     logger.info(f"Removing source: {command.source_id}")
 
-    success, retry = stop_adapter(command)
+    success, retry = stop_adapter(command.source_id)
     if success or retry:
         storage.delete(command.source_id)
 
@@ -130,11 +133,11 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
     # RTSP check
     is_valid, retry, msg = check_rtsp_connection(command.rtsp_url)
     if not is_valid:
-        logger.error(f"RTSP check {command.rtsp_url} failed: {msg}")
+        logger.error(f"RTSP check {redact_url( command.rtsp_url)} failed: {msg}")
         return False, retry
 
     adapter_name = general_settings.container_name_prefix + command.source_id
-    logger.info(f"Starting adapter {adapter_name} for {command.rtsp_url}")
+    logger.info(f"Starting adapter {adapter_name} for {redact_url( command.rtsp_url)}")
 
     try:
         # Verify docker exists
@@ -215,13 +218,12 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
         return False, True
 
 
-def stop_adapter(command: SourceCommand):
-    rtsp_id = command.source_id
-    if not rtsp_id:
+def stop_adapter(source_id: str) -> tuple[bool, bool]:
+    if not source_id:
         logger.error("stop_adapter: Missing 'source_id' in command")
         return False, False
 
-    adapter_name = general_settings.container_name_prefix + rtsp_id
+    adapter_name = general_settings.container_name_prefix + source_id
     logger.info(f"Stopping adapter {adapter_name}")
 
     try:
