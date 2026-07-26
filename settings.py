@@ -3,8 +3,8 @@ Default settings, loaded from a .env file (or real
 environment variables, which take precedence over .env).
 """
 
-from pydantic import Field
 from typing import List
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,7 +38,8 @@ class KafkaSettings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", env_prefix="KAFKA_", extra="ignore"
     )
 
-    commands_topic: str = "rtsp-source-commands"
+    commands_topic: str = "source-commands"
+    status_topic: str = "source-events"
     bootstrap_server: str = "localhost:29092"
     group_id: str = "source-management"
 

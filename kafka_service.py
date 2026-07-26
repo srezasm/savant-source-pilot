@@ -1,11 +1,14 @@
-import time
 import json
 import logging
 import threading
 from typing import Callable, Optional
-from kafka import KafkaProducer, KafkaConsumer
+from kafka import KafkaProducer, KafkaConsumer, KafkaAdminClient
 
 logger = logging.getLogger(__name__)
+
+
+class TopicsNotFoundError(Exception):
+    """Raised at startup when one or more required topics don't exist on the broker."""
 
 
 def _value_serializer(v):
@@ -24,14 +27,18 @@ class KafkaService:
     def __init__(
         self,
         consume_topics: list[str],
+        produce_topics: list[str],
         bootstrap_servers: list[str],
         group_id: str,
         on_message: Callable[[object, "KafkaService"], None],
+        verify_topics: bool = True,
     ):
         self.consume_topics = consume_topics
+        self.produce_topics = produce_topics
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
         self.on_message = on_message
+        self.verify_topics = verify_topics
 
         self._producer: Optional[KafkaProducer] = None
         self._consumer: Optional[KafkaConsumer] = None
@@ -68,11 +75,37 @@ class KafkaService:
             session_timeout_ms=30000,  # max time between heartbeats
             request_timeout_ms=40000,  # max waiting time for response from broker
             max_poll_interval_ms=60000,  # max time between two polls(processing messages)
-            value_deserializer=lambda v: (
-                v.decode("utf-8") if v is not None else None
-            ),  # json.loads(v.decode("utf-8")),
+            value_deserializer=lambda v: (v.decode("utf-8") if v is not None else None),
             key_deserializer=lambda k: k.decode("utf-8") if k is not None else None,
         )
+
+    def _verify_topics(self):
+        """
+        Check that every required topic (input + output) exists on the
+        broker before starting anything. Raises TopicsNotFoundError if any
+        are missing — fail fast at startup instead of silently consuming
+        nothing (missing input topic) or silently failing every produce
+        call later (missing output topic).
+        """
+        required = set(self.consume_topics) | set(self.produce_topics)
+        if not required:
+            return
+
+        admin = KafkaAdminClient(bootstrap_servers=self.bootstrap_servers)
+        try:
+            existing = set(admin.list_topics())
+        finally:
+            admin.close()
+
+        missing = required - existing
+        if missing:
+            raise TopicsNotFoundError(
+                f"Required Kafka topic(s) not found on broker: {sorted(missing)}. "
+                f"Create them first, or pass verify_topics=False to skip this check "
+                f"(e.g. if your broker auto-creates topics on first use)."
+            )
+
+        logger.info("Verified topics exist: %s", sorted(required))
 
     def produce(self, topic: str, value, key=None, headers: Optional[list] = None):
         """
@@ -101,21 +134,6 @@ class KafkaService:
         logger.error("Failed to deliver message", exc_info=excp)
 
     def _watch_kafka(self):
-        # Check if topics exists
-        while True:
-            existing_topics = list(self._consumer.topics())
-            if not all([t in existing_topics for t in self.consume_topics]):
-                logging.warning(
-                    f"Expected consuming topics are: %s, while existing ones are: %s",
-                    self.consume_topics,
-                    existing_topics,
-                )
-                time.sleep(10)
-                self._consumer.close()
-                continue  # Try again
-            else:
-                break
-
         while not self._stop_event.is_set():
             try:
                 for record in self._consumer:
@@ -145,6 +163,9 @@ class KafkaService:
     def start(self):
         if self._thread is not None:
             raise RuntimeError("KafkaService already started")
+
+        if self.verify_topics:
+            self._verify_topics()
 
         self._producer = self._build_producer()
         self._consumer = self._build_consumer()

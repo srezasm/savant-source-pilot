@@ -3,7 +3,10 @@ import logging
 import threading
 import subprocess
 from typing import Callable, Optional
+from utils import gen_stat_msg
 from storage import SourceStore
+from settings import kafka_settings
+from kafka_service import KafkaService
 from source_command import SourceCommand
 
 logger = logging.getLogger(__name__)
@@ -15,12 +18,16 @@ class HealthService:
         retry_seconds: int,
         container_name_prefix: str,
         storage: SourceStore,
+        kafka_service: KafkaService,
         run_source: Callable[[SourceCommand], list[bool]],
+        remove_source: Callable[[SourceCommand], list[bool]],
     ):
         self.retry_seconds = retry_seconds
         self.container_name_prefix = container_name_prefix
         self.storage = storage
         self.run_source = run_source
+        self.remove_source = remove_source
+        self.kafka_service = kafka_service
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -49,38 +56,62 @@ class HealthService:
             )
             active_source_ids = set(self.storage.list_ids())
 
-            sources_needing_retry = active_source_ids - running_adapter_ids
-            if len(untracked := running_adapter_ids - active_source_ids):
-
-                logging.critical(
-                    f"There are untracked adapters running:"
-                    f"{[self.container_name_prefix + u for u in untracked]}"
-                )
-
-            sources_to_retry = {
-                src_id: self.storage.get(src_id) for src_id in sources_needing_retry
+            # Remove untracked containers that are running but not in storage
+            untracked_source_ids = running_adapter_ids - active_source_ids
+            sources_to_remove = {
+                src_id: self.storage.get(src_id) for src_id in untracked_source_ids
             }
-
-            for src_id, command in sources_to_retry.items():
-                if command is None:
-                    logging.warning(f"No persisted command found for source '{src_id}'")
-                    continue
-
-                success, retry = self.run_source(command)
-                if success or retry:
-                    if success:
-                        logging.info(
-                            f"Successfully added source {src_id} in retry. Active sources: {list(active_source_ids)}"
-                        )
-                    else:
-                        logging.info(
-                            f"Unable to add the new source {src_id}. Will retry again later."
-                        )
-                else:
-                    logging.error(
-                        f"Retry to start adapter for {command.rtsp_url} failed again"
+            for src_id, command in sources_to_remove.items():
+                success, retry = self.remove_source(command)
+                if success:
+                    logger.info(f"Successfully removed source {src_id}")
+                    self.kafka_service.produce(
+                        kafka_settings.status_topic, gen_stat_msg("terminated"), src_id
                     )
-                    return
+                elif retry:
+                    logger.info(
+                        f"Unable to remove the source {src_id}. Will retry later."
+                    )
+                    self.kafka_service.produce(
+                        kafka_settings.status_topic, gen_stat_msg("draining"), src_id
+                    )
+                else:
+                    logger.error(f"Failed to stop adapter for source with id={src_id}")
+
+            # Retry starting adapters that are in storage but not running
+            retry_source_ids = active_source_ids - running_adapter_ids
+            sources_to_retry = {
+                src_id: self.storage.get(src_id) for src_id in retry_source_ids
+            }
+            for src_id, command in sources_to_retry.items():
+                success, retry = self.run_source(command)
+                if success:
+                    logging.info(
+                        f"Successfully added source {src_id} in retry. Active sources: {list(active_source_ids)}"
+                    )
+                    self.kafka_service.produce(
+                        kafka_settings.status_topic,
+                        gen_stat_msg("recovered"),
+                        command.source_id,
+                    )
+                elif retry:
+                    self.kafka_service.produce(
+                        kafka_settings.status_topic,
+                        gen_stat_msg("stalled"),
+                        command.source_id,
+                    )
+                    logging.info(
+                        f"Retry to start adapter for {src_id} failed, but will retry again later"
+                    )
+                else:
+                    self.kafka_service.produce(
+                        kafka_settings.status_topic,
+                        gen_stat_msg("aborted"),
+                        command.source_id,
+                    )
+                    logging.error(
+                        f"Retry to start adapter for {src_id} failed, and wont retry again later"
+                    )
 
         except FileNotFoundError:
             logging.error("Docker is not installed or not in PATH")

@@ -5,11 +5,12 @@ import threading
 import subprocess
 from functools import partial
 from contextlib import ExitStack
+from settings import *
+from utils import gen_stat_msg
 from storage import SourceStore
 from kafka_service import KafkaService
 from health_service import HealthService
 from source_command import SourceCommand
-from settings import general_settings, kafka_settings, redis_settings
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -50,7 +51,9 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
         return False, True, f"Connection test error: {str(e)}"
 
 
-def add_sources(command: SourceCommand, storage: SourceStore):
+def add_sources(
+    command: SourceCommand, storage: SourceStore, kafka_service: KafkaService
+):
     if storage.exists(command.source_id):
         logger.warning(f"RTSP id '{command.source_id}' already exists")
         return
@@ -65,16 +68,27 @@ def add_sources(command: SourceCommand, storage: SourceStore):
             logger.info(
                 f"Successfully added source {command.source_id}. Active sources: {storage.list_ids()}"
             )
+            kafka_service.produce(
+                kafka_settings.status_topic, gen_stat_msg("active"), command.source_id
+            )
         else:
             logger.info(
                 f"Unable to add the new source {command.source_id}. Will retry later."
             )
+            kafka_service.produce(
+                kafka_settings.status_topic, gen_stat_msg("faulted"), command.source_id
+            )
     else:
         logger.error(f"Failed to start adapter for {command.rtsp_url}")
+        kafka_service.produce(
+            kafka_settings.status_topic, gen_stat_msg("aborted"), command.source_id
+        )
         return
 
 
-def remove_sources(command: SourceCommand, storage: SourceStore):
+def remove_sources(
+    command: SourceCommand, storage: SourceStore, kafka_service: KafkaService
+):
     if not storage.exists(command.source_id):
         logger.warning(f"RTSP id '{command.source_id}' does not exist")
         return
@@ -89,11 +103,21 @@ def remove_sources(command: SourceCommand, storage: SourceStore):
             logger.info(
                 f"Successfully removed source {command.source_id}. Active sources: {storage.list_ids()}"
             )
+            kafka_service.produce(
+                kafka_settings.status_topic,
+                gen_stat_msg("terminated"),
+                command.source_id,
+            )
         else:
             logger.info(
                 f"Unable to remove the source {command.source_id}. Will retry later."
             )
+            kafka_service.produce(
+                kafka_settings.status_topic, gen_stat_msg("draining"), command.source_id
+            )
     else:
+        # * This case should not happen, because all of the edge cases should have been
+        # * resolved when the stream was getting started.
         logger.error(f"Failed to stop adapter for source with id={command.source_id}")
         return
 
@@ -214,7 +238,7 @@ def stop_adapter(command: SourceCommand):
 
         if result.returncode == 0:
             logger.info(f"Successfully stopped adapter: {adapter_name}")
-            return True
+            return True, False
         else:
             if "No such container" in result.stderr:
                 logger.warning(f"Container {adapter_name} was not running")
@@ -241,9 +265,9 @@ def on_message(record, service: KafkaService, storage: SourceStore):
         command = SourceCommand.model_validate_json(record.value)
 
         if command.type == "add":
-            add_sources(command, storage)
+            add_sources(command, storage, service)
         elif command.type == "remove":
-            remove_sources(command, storage)
+            remove_sources(command, storage, service)
         else:
             logger.warning(f"Unknown key type: {record.key}")
 
@@ -261,6 +285,7 @@ def main():
     source_store = SourceStore(redis_settings.host, redis_settings.port)
     kafka_service = KafkaService(
         consume_topics=[kafka_settings.commands_topic],
+        produce_topics=[kafka_settings.status_topic],
         bootstrap_servers=kafka_settings.bootstrap_server,
         group_id=kafka_settings.group_id,
         on_message=partial(on_message, storage=source_store),
@@ -269,7 +294,9 @@ def main():
         retry_seconds=general_settings.retry_seconds,
         container_name_prefix=general_settings.container_name_prefix,
         storage=source_store,
+        kafka_service=kafka_service,
         run_source=run_adapter,
+        remove_source=stop_adapter,
     )
 
     def handle_signal(signum, frame):

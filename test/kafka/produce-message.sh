@@ -3,7 +3,7 @@
 # produce-rtsp-command.sh
 #
 # Interactively (or via flags) build a JSON message and produce it to the
-# "rtsp-source-commands" Kafka topic, running inside a Docker container
+# "source-commands" Kafka topic, running inside a Docker container
 # named "kafka".
 #
 # Message format:
@@ -19,7 +19,7 @@ set -euo pipefail
 
 CONTAINER_NAME="kafka"
 BOOTSTRAP_SERVER="localhost:9092"
-TOPIC="rtsp-source-commands"
+TOPIC="source-commands"
 
 TYPE=""
 SOURCE_ID=""
@@ -174,7 +174,7 @@ echo "----------------------------------------"
 
 # ---------- produce ----------
 #
-# rtsp-source-commands is a compacted topic, so every record needs a
+# source-commands is a compacted topic, so every record needs a
 # non-null key (compaction dedupes by key). We use "type" as the key,
 # separated from the value by a tab, and tell the producer to parse it.
 
