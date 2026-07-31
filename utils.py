@@ -1,6 +1,14 @@
 from typing import Literal
 from datetime import datetime
 from urllib.parse import urlparse
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class OperationResult:
+    success: bool
+    retry: bool
+    reason: str
 
 
 def gen_stat_msg(

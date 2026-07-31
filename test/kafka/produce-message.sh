@@ -8,9 +8,9 @@
 #
 # Message format:
 # {
-#   "type": "add" | "remove" | "update",
+#   "type": "add" | "remove",
 #   "source_id": "cam-front",
-#   "rtsp_url": "rtsp://...",
+#   "rtsp_url": "rtsp://..." | null,   // only used for "add"
 #   "timestamp": "2026-01-01T00:00:00Z",
 #   "config": { ... }   // optional, left empty for now
 # }
@@ -33,21 +33,23 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-  -t, --type <add|remove|update>   Message type
+  -t, --type <add|remove>          Message type
   -s, --source-id <id>             Source ID (e.g. cam-front)
-  -u, --rtsp-url <url>             RTSP URL (e.g. rtsp://host:554/stream)
+  -u, --rtsp-url <url>             RTSP URL (e.g. rtsp://host:554/stream) — only used for "add"
       --timestamp <ISO8601>        Timestamp (defaults to "now" if omitted)
   -c, --config <json>              Optional config object as a raw JSON string, e.g. '{"fps":15}'
   -r, --random                     Fill unspecified fields with random values
   -h, --help                       Show this help message
 
 Any field not provided via flags (and not filled by --random) will be
-prompted for interactively.
+prompted for interactively. For "remove", only the source ID is
+prompted for — rtsp_url is skipped and the timestamp defaults to now
+without prompting.
 
 Examples:
   $(basename "$0") -t add -s cam-front -u rtsp://192.168.1.10:554/stream1
   $(basename "$0") --random
-  $(basename "$0") -t update -s cam-back -r
+  $(basename "$0") -t remove -s cam-back
 EOF
 }
 
@@ -113,26 +115,47 @@ prompt() {
 
 # ---------- fill fields ----------
 
-if [[ "$RANDOM_MODE" == true ]]; then
-  [[ -z "$TYPE" ]]      && TYPE=$(random_choice "add remove update")
-  [[ -z "$SOURCE_ID" ]] && SOURCE_ID=$(random_source_id)
-  [[ -z "$RTSP_URL" ]]  && RTSP_URL=$(random_rtsp_url)
-  [[ -z "$TIMESTAMP" ]] && TIMESTAMP=$(random_timestamp)
-else
-  [[ -z "$TYPE" ]]      && TYPE=$(prompt "Type (add/remove/update)" "add")
-  [[ -z "$SOURCE_ID" ]] && SOURCE_ID=$(prompt "Source ID" "cam-front")
-  [[ -z "$RTSP_URL" ]]  && RTSP_URL=$(prompt "RTSP URL" "rtsp://192.168.1.10:554/stream1")
-  [[ -z "$TIMESTAMP" ]] && TIMESTAMP=$(prompt "Timestamp (ISO8601)" "$(now_timestamp)")
+# type is determined first, since it decides which other fields are needed
+if [[ -z "$TYPE" ]]; then
+  if [[ "$RANDOM_MODE" == true ]]; then
+    TYPE=$(random_choice "add remove")
+  else
+    TYPE=$(prompt "Type (add/remove)" "add")
+  fi
 fi
 
 # validate type
 case "$TYPE" in
-  add|remove|update) ;;
+  add|remove) ;;
   *)
-    echo "Error: --type must be one of: add, remove, update (got: '$TYPE')" >&2
+    echo "Error: --type must be one of: add, remove (got: '$TYPE')" >&2
     exit 1
     ;;
 esac
+
+# source_id is always required, regardless of type
+if [[ -z "$SOURCE_ID" ]]; then
+  if [[ "$RANDOM_MODE" == true ]]; then
+    SOURCE_ID=$(random_source_id)
+  else
+    SOURCE_ID=$(prompt "Source ID" "cam-front")
+  fi
+fi
+
+if [[ "$TYPE" == "remove" ]]; then
+  # remove only needs a source_id; rtsp_url isn't applicable, and the
+  # timestamp is just set to "now" without prompting.
+  RTSP_URL=""
+  [[ -z "$TIMESTAMP" ]] && TIMESTAMP=$(now_timestamp)
+else
+  if [[ "$RANDOM_MODE" == true ]]; then
+    [[ -z "$RTSP_URL" ]]  && RTSP_URL=$(random_rtsp_url)
+    [[ -z "$TIMESTAMP" ]] && TIMESTAMP=$(random_timestamp)
+  else
+    [[ -z "$RTSP_URL" ]]  && RTSP_URL=$(prompt "RTSP URL" "rtsp://192.168.1.10:554/stream1")
+    [[ -z "$TIMESTAMP" ]] && TIMESTAMP=$(prompt "Timestamp (ISO8601)" "$(now_timestamp)")
+  fi
+fi
 
 # ---------- build JSON ----------
 
@@ -149,20 +172,25 @@ if command -v jq >/dev/null 2>&1; then
       --arg rtsp_url "$RTSP_URL" \
       --arg timestamp "$TIMESTAMP" \
       --argjson config "$CONFIG" \
-      '{type: $type, source_id: $source_id, rtsp_url: $rtsp_url, timestamp: $timestamp, config: $config}')
+      '{type: $type, source_id: $source_id, rtsp_url: (if $rtsp_url == "" then null else $rtsp_url end), timestamp: $timestamp, config: $config}')
   else
     MESSAGE=$(jq -nc \
       --arg type "$TYPE" \
       --arg source_id "$SOURCE_ID" \
       --arg rtsp_url "$RTSP_URL" \
       --arg timestamp "$TIMESTAMP" \
-      '{type: $type, source_id: $source_id, rtsp_url: $rtsp_url, timestamp: $timestamp, config: {}}')
+      '{type: $type, source_id: $source_id, rtsp_url: (if $rtsp_url == "" then null else $rtsp_url end), timestamp: $timestamp, config: {}}')
   fi
 else
   # fallback: manual JSON construction (no jq available)
   CONFIG_JSON="${CONFIG:-{\}}"
+  if [[ -z "$RTSP_URL" ]]; then
+    RTSP_FIELD="null"
+  else
+    RTSP_FIELD="\"${RTSP_URL}\""
+  fi
   MESSAGE=$(cat <<EOF
-{"type":"${TYPE}","source_id":"${SOURCE_ID}","rtsp_url":"${RTSP_URL}","timestamp":"${TIMESTAMP}","config":${CONFIG_JSON}}
+{"type":"${TYPE}","source_id":"${SOURCE_ID}","rtsp_url":${RTSP_FIELD},"timestamp":"${TIMESTAMP}","config":${CONFIG_JSON}}
 EOF
 )
 fi

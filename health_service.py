@@ -3,11 +3,11 @@ import logging
 import threading
 import subprocess
 from typing import Callable, Optional
-from utils import gen_stat_msg
 from storage import SourceStore
 from settings import kafka_settings
 from kafka_service import KafkaService
 from source_command import SourceCommand
+from utils import gen_stat_msg, OperationResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +19,8 @@ class HealthService:
         container_name_prefix: str,
         storage: SourceStore,
         kafka_service: KafkaService,
-        run_source: Callable[[SourceCommand], tuple[bool, bool]],
-        remove_source: Callable[[str], tuple[bool, bool]],
+        run_source: Callable[[SourceCommand], OperationResult],
+        remove_source: Callable[[str], OperationResult],
     ):
         self.retry_seconds = retry_seconds
         self.container_name_prefix = container_name_prefix
@@ -41,31 +41,29 @@ class HealthService:
                 text=True,
             )
             if result.returncode != 0:
-                logging.error(
+                logger.error(
                     f"Error while getting list of running adapters: {result.stderr}"
                 )
                 return
 
             containers = result.stdout.strip().split("\n")
-            running_adapter_ids = set(
-                [
-                    c.removeprefix(self.container_name_prefix)
-                    for c in containers
-                    if c.startswith(self.container_name_prefix)
-                ]
-            )
+            running_adapter_ids = {
+                c.removeprefix(self.container_name_prefix)
+                for c in containers
+                if c.startswith(self.container_name_prefix)
+            }
             active_source_ids = set(self.storage.list_ids())
 
             # Remove untracked containers that are running but not in storage
             untracked_source_ids = running_adapter_ids - active_source_ids
             for src_id in untracked_source_ids:
-                success, retry = self.remove_source(src_id)
-                if success:
+                result = self.remove_source(src_id)
+                if result.success:
                     logger.info(f"Successfully removed source {src_id}")
                     self.kafka_service.produce(
                         kafka_settings.status_topic, gen_stat_msg("terminated"), src_id
                     )
-                elif retry:
+                elif result.retry:
                     logger.info(
                         f"Unable to remove the source {src_id}. Will retry later."
                     )
@@ -81,9 +79,9 @@ class HealthService:
                 src_id: self.storage.get(src_id) for src_id in retry_source_ids
             }
             for src_id, command in sources_to_retry.items():
-                success, retry = self.run_source(command)
-                if success:
-                    logging.info(
+                result = self.run_source(command)
+                if result.success:
+                    logger.info(
                         f"Successfully added source {src_id} in retry. Active sources: {list(active_source_ids)}"
                     )
                     self.kafka_service.produce(
@@ -91,13 +89,13 @@ class HealthService:
                         gen_stat_msg("recovered"),
                         command.source_id,
                     )
-                elif retry:
+                elif result.retry:
                     self.kafka_service.produce(
                         kafka_settings.status_topic,
                         gen_stat_msg("stalled"),
                         command.source_id,
                     )
-                    logging.info(
+                    logger.info(
                         f"Retry to start adapter for {src_id} failed, but will retry again later"
                     )
                 else:
@@ -106,18 +104,18 @@ class HealthService:
                         gen_stat_msg("aborted"),
                         command.source_id,
                     )
-                    logging.error(
+                    logger.error(
                         f"Retry to start adapter for {src_id} failed, and wont retry again later"
                     )
 
         except FileNotFoundError:
-            logging.error("Docker is not installed or not in PATH")
+            logger.error("Docker is not installed or not in PATH")
         except subprocess.TimeoutExpired:
-            logging.error(
+            logger.error(
                 "Docker command timed out while retrying to run failed adapters"
             )
         except Exception as e:
-            logging.exception(
+            logger.exception(
                 f"Unexpected error while retrying to run failed adapters: {e}"
             )
 

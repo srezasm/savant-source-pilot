@@ -73,18 +73,14 @@ class SourceCommand(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["add", "remove"] = Field(
-        ..., description="Type of operation"
-    )
+    type: Literal["add", "remove"] = Field(..., description="Type of operation")
 
     source_id: str = Field(
         ...,
         description="Unique identifier for the source",
     )
 
-    rtsp_url: Optional[str] = Field(
-        None, description="RTSP URL (required for add)"
-    )
+    rtsp_url: Optional[str] = Field(None, description="RTSP URL (required for add)")
 
     timestamp: datetime = Field(
         default_factory=datetime.now,

@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
+def check_rtsp_connection(rtsp_url: str) -> OperationResult:
     logger.info(f"Testing RTSP connection to: {redact_url(rtsp_url)}")
     try:
         # Use ffprobe (from ffmpeg) to test the stream
@@ -39,17 +39,31 @@ def check_rtsp_connection(rtsp_url: str) -> tuple[bool, bool, str]:
 
         if result.returncode == 0:
             logger.info(f"RTSP connection test successful: {rtsp_url}")
-            return True, False, "Valid and reachable"
+            return OperationResult(
+                success=True, retry=False, reason="Valid and reachable"
+            )
         else:
-            return False, True, f"Cannot connect to stream (ffprobe failed)"
+            return OperationResult(
+                success=False,
+                retry=True,
+                reason="Cannot connect to stream (ffprobe failed)",
+            )
 
     except FileNotFoundError:
         logger.warning("ffprobe not found. Skipping connection test.")
-        return True, False, "Format looks valid (ffprobe not available for testing)"
+        return OperationResult(
+            success=True,
+            retry=False,
+            reason="Format looks valid (ffprobe not available for testing)",
+        )
     except subprocess.TimeoutExpired:
-        return False, True, "Connection test timed out"
+        return OperationResult(
+            success=False, retry=True, reason="Connection test timed out"
+        )
     except Exception as e:
-        return False, True, f"Connection test error: {str(e)}"
+        return OperationResult(
+            success=False, retry=True, reason=f"Connection test error: {str(e)}"
+        )
 
 
 def add_sources(
@@ -63,11 +77,11 @@ def add_sources(
         f"Adding source: {command.source_id} -> {redact_url( command.rtsp_url)}"
     )
 
-    success, retry = run_adapter(command)
-    if success or retry:
+    result = run_adapter(command)
+    if result.success or result.retry:
         storage.add(command)
 
-        if success:
+        if result.success:
             logger.info(
                 f"Successfully added source {command.source_id}. Active sources: {storage.list_ids()}"
             )
@@ -98,11 +112,11 @@ def remove_sources(
 
     logger.info(f"Removing source: {command.source_id}")
 
-    success, retry = stop_adapter(command.source_id)
-    if success or retry:
+    result = stop_adapter(command.source_id)
+    if result.success or result.retry:
         storage.delete(command.source_id)
 
-        if success:
+        if result.success:
             logger.info(
                 f"Successfully removed source {command.source_id}. Active sources: {storage.list_ids()}"
             )
@@ -125,19 +139,21 @@ def remove_sources(
         return
 
 
-def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
+def run_adapter(command: SourceCommand) -> OperationResult:
     if not command.source_id or not command.rtsp_url:
         logger.error("run_adapter: Missing 'source_id' or 'rtsp_url' in command")
-        return False, False
+        return OperationResult(success=False, retry=False, reason="")
 
     # RTSP check
-    is_valid, retry, msg = check_rtsp_connection(command.rtsp_url)
-    if not is_valid:
-        logger.error(f"RTSP check {redact_url( command.rtsp_url)} failed: {msg}")
-        return False, retry
+    result = check_rtsp_connection(command.rtsp_url)
+    if not result.success:
+        logger.error(
+            f"RTSP check {redact_url(command.rtsp_url)} failed: {result.reason}"
+        )
+        return OperationResult(success=False, retry=result.retry, reason="")
 
     adapter_name = general_settings.container_name_prefix + command.source_id
-    logger.info(f"Starting adapter {adapter_name} for {redact_url( command.rtsp_url)}")
+    logger.info(f"Starting adapter {adapter_name} for {redact_url(command.rtsp_url)}")
 
     try:
         # Verify docker exists
@@ -195,33 +211,33 @@ def run_adapter(command: SourceCommand) -> tuple[bool, bool]:
 
         if result.returncode == 0:
             logger.info(f"Successfully started adapter: {adapter_name}")
-            return True, False
+            return OperationResult(success=True, retry=False, reason="")
         elif "permission denied" in result.stderr:
             logger.error(
-                f"Current user doesn't have access to Docker. Run this script in sudo mode or give your user access to Docker."
+                "Current user doesn't have access to Docker. Run this script in sudo mode or give your user access to Docker."
             )
-            return False, False
+            return OperationResult(success=False, retry=False, reason="")
         else:
             logger.error(
                 f"Failed to start adapter {adapter_name}. Stderr: {result.stderr.strip()}"
             )
-            return False, True
+            return OperationResult(success=False, retry=True, reason="")
 
     except FileNotFoundError:
         logger.error("Docker is not installed or not in PATH")
-        return False, False
+        return OperationResult(success=False, retry=False, reason="")
     except subprocess.TimeoutExpired:
         logger.error("Docker command timed out while starting adapter")
-        return False, True
+        return OperationResult(success=False, retry=True, reason="")
     except Exception as e:
         logger.exception(f"Unexpected error starting adapter {adapter_name}: {e}")
-        return False, True
+        return OperationResult(success=False, retry=True, reason="")
 
 
-def stop_adapter(source_id: str) -> tuple[bool, bool]:
+def stop_adapter(source_id: str) -> OperationResult:
     if not source_id:
         logger.error("stop_adapter: Missing 'source_id' in command")
-        return False, False
+        return OperationResult(success=False, retry=False, reason="")
 
     adapter_name = general_settings.container_name_prefix + source_id
     logger.info(f"Stopping adapter {adapter_name}")
@@ -240,26 +256,26 @@ def stop_adapter(source_id: str) -> tuple[bool, bool]:
 
         if result.returncode == 0:
             logger.info(f"Successfully stopped adapter: {adapter_name}")
-            return True, False
+            return OperationResult(success=True, retry=False, reason="")
         else:
             if "No such container" in result.stderr:
                 logger.warning(f"Container {adapter_name} was not running")
-                return True, False
+                return OperationResult(success=True, retry=False, reason="")
             else:
                 logger.error(
                     f"Failed to stop adapter {adapter_name}: {result.stderr.strip()}"
                 )
-                return False, True
+                return OperationResult(success=False, retry=True, reason="")
 
     except FileNotFoundError:
         logger.warning("Docker is not available")
-        return False, False
+        return OperationResult(success=False, retry=False, reason="")
     except subprocess.TimeoutExpired:
         logger.error(f"Timeout while stopping adapter {adapter_name}")
-        return False, True
+        return OperationResult(success=False, retry=True, reason="")
     except Exception as e:
         logger.exception(f"Unexpected error stopping adapter {adapter_name}: {e}")
-        return False, True
+        return OperationResult(success=False, retry=True, reason="")
 
 
 def on_message(record, service: KafkaService, storage: SourceStore):
