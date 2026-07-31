@@ -82,7 +82,7 @@ class HealthService:
                 result = self.run_source(command)
                 if result.success:
                     logger.info(
-                        f"Successfully added source {src_id} in retry. Active sources: {list(active_source_ids)}"
+                        f"Successfully added source {src_id} in retry"
                     )
                     self.kafka_service.produce(
                         kafka_settings.status_topic,

@@ -28,7 +28,7 @@ class KafkaService:
         self,
         consume_topics: list[str],
         produce_topics: list[str],
-        bootstrap_servers: list[str],
+        bootstrap_servers: list[str] | str,
         group_id: str,
         on_message: Callable[[object, "KafkaService"], None],
         verify_topics: bool = True,
