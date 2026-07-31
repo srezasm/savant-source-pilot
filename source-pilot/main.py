@@ -74,7 +74,7 @@ def add_sources(
         return
 
     logger.info(
-        f"Adding source: {command.source_id} -> {redact_url( command.rtsp_url)}"
+        f"Adding source: {command.source_id} -> {redact_url(command.rtsp_url)}"
     )
 
     result = run_adapter(command)
@@ -96,7 +96,7 @@ def add_sources(
                 kafka_settings.status_topic, gen_stat_msg("faulted"), command.source_id
             )
     else:
-        logger.error(f"Failed to start adapter for {redact_url( command.rtsp_url)}")
+        logger.error(f"Failed to start adapter for {redact_url(command.rtsp_url)}")
         kafka_service.produce(
             kafka_settings.status_topic, gen_stat_msg("aborted"), command.source_id
         )
